@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HalwaShare — Room</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="room-page">
+
+  <header class="room-header">
+    <div class="header-left">
+      <span class="logo-icon-sm">🍮</span>
+      <span class="app-name">HalwaShare</span>
+    </div>
+    <div class="header-center">
+      <span class="room-code-label">Room:</span>
+      <span id="header-code" class="room-code-badge">----</span>
+    </div>
+    <div class="header-right">
+      <button id="btn-sound" class="icon-btn" title="Toggle sound">🔔</button>
+      <button id="btn-theme" class="icon-btn" title="Toggle dark mode">🌙</button>
+      <button id="btn-exit" class="btn btn-danger-sm">Exit</button>
+    </div>
+  </header>
+
+  <div class="room-body">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-section">
+        <h3 class="sidebar-heading">Participants</h3>
+        <ul id="user-list" class="user-list"></ul>
+      </div>
+      <div class="sidebar-section qr-section">
+        <h3 class="sidebar-heading">Scan to Join</h3>
+        <div id="qr-container">
+          <img id="qr-img" src="" alt="QR Code" class="qr-img hidden" />
+          <p id="qr-url" class="qr-url"></p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Chat area -->
+    <main class="chat-area">
+      <div id="messages" class="messages"></div>
+      <div id="typing-indicator" class="typing-indicator hidden"></div>
+
+      <!-- Drop zone overlay -->
+      <div id="drop-overlay" class="drop-overlay hidden">
+        <div class="drop-overlay-inner">
+          <span>📂</span>
+          <p>Drop file to share with everyone</p>
+        </div>
+      </div>
+
+      <div class="input-bar">
+        <label for="file-input" class="icon-btn file-btn" title="Share a file">📎</label>
+        <input type="file" id="file-input" class="hidden" multiple />
+        <input
+          id="msg-input"
+          class="msg-input"
+          type="text"
+          placeholder="Type a message..."
+          autocomplete="off"
+          maxlength="2000"
+        />
+        <button id="btn-send" class="btn btn-primary">Send</button>
+      </div>
+    </main>
+  </div>
+
+  <!-- QR modal (mobile) -->
+  <div id="qr-modal" class="modal hidden">
+    <div class="modal-backdrop" id="qr-modal-backdrop"></div>
+    <div class="modal-content">
+      <h3>Scan to Join</h3>
+      <img id="qr-modal-img" src="" alt="QR Code" />
+      <p id="qr-modal-url" class="qr-url"></p>
+      <button id="qr-modal-close" class="btn btn-secondary">Close</button>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

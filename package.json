@@ -1,0 +1,14 @@
+{
+  "name": "halwashare",
+  "version": "1.0.0",
+  "description": "Local network P2P chat and file sharing for 2-5 people",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.7.2"
+  }
+}

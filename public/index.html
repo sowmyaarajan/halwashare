@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HalwaShare</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="landing">
+    <div class="landing-card">
+      <div class="logo">
+        <span class="logo-icon">🍮</span>
+        <h1>HalwaShare</h1>
+        <p class="tagline">Chat &amp; share files on your local network — no cloud, no accounts.</p>
+      </div>
+
+      <div class="landing-actions">
+        <button id="btn-create" class="btn btn-primary btn-large">Create Room</button>
+        <div class="divider"><span>or</span></div>
+        <div class="join-form">
+          <input
+            id="input-code"
+            class="code-input"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            maxlength="4"
+            placeholder="Enter 4-digit code"
+            autocomplete="off"
+          />
+          <button id="btn-join" class="btn btn-secondary btn-large">Join Room</button>
+        </div>
+        <p id="landing-error" class="error-text hidden"></p>
+      </div>
+    </div>
+    <button id="theme-toggle-landing" class="theme-toggle" title="Toggle dark mode">🌙</button>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
