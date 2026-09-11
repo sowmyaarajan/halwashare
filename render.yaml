@@ -1,0 +1,32 @@
+# Render Blueprint — https://render.com/docs/infrastructure-as-code
+#
+# Rooms and peer lists live in this process's memory, so HalwaShare must run as
+# exactly ONE instance. Do not add numInstances or enable autoscaling without
+# first adding @socket.io/redis-adapter and sticky sessions.
+
+services:
+  - type: web
+    name: halwashare
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+
+      # Makes the room QR code point at the public host instead of the
+      # container's private LAN address. Set this to your Render URL.
+      - key: PUBLIC_URL
+        sync: false
+
+      # Optional: without TURN, peers behind symmetric NAT fall back to
+      # relaying through this server instead of connecting directly.
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false
