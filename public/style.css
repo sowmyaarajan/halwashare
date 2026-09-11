@@ -293,6 +293,7 @@ body.dark .btn-primary { color: #221a0c; }
 /* ── Fatal error screen ───────────────────────────────────── */
 .fatal {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -311,7 +312,15 @@ body.dark .btn-primary { color: #221a0c; }
 .fatal-card h2 { margin: 14px 0 22px; font-size: 18px; font-weight: 600; }
 
 /* ── Room shell ───────────────────────────────────────────── */
-.room-page { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+/* 100vh on a phone is the viewport with the browser chrome collapsed, which
+   pushes the composer below the visible area. dvh tracks the real height. */
+.room-page {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 
 .offline-banner {
   padding: 9px;
@@ -553,6 +562,23 @@ body.dark .caps-note.warn { color: var(--accent-warm); }
 .msg-row.self .bubble a { color: #fff; }
 body.dark .msg-row.self .bubble,
 body.dark .msg-row.self .bubble a { color: #221a0c; }
+
+/* Delivery ticks, tucked into the corner of your own bubble. */
+.ticks {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  vertical-align: baseline;
+  opacity: .6;
+  cursor: default;
+}
+.ticks.delivered { opacity: 1; }
+body:not(.dark) .msg-row.self .ticks { color: #fff; }
+body.dark .msg-row.self .ticks { color: #221a0c; }
+
+.file-card.received .file-status { color: var(--good); font-weight: 600; }
 
 .copy-btn {
   padding: 2px 6px;
@@ -821,7 +847,15 @@ body.dark .drop-inner { color: var(--accent-warm); }
   .code-pill { font-size: 15px; padding: 6px 14px; }
   .msg-row { max-width: 92%; }
   .file-card { width: 290px; }
-  .composer { padding: 10px 12px; }
+
+  /* Keep the composer clear of the iPhone home bar. */
+  .composer {
+    padding: 10px 12px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  }
+  /* Anything under 16px makes iOS Safari zoom in on focus. */
+  .msg-input, .code-input { font-size: 16px; }
+  .code-input { letter-spacing: 6px; }
   .features { grid-template-columns: 1fr; }
   .toasts { right: 12px; left: 12px; bottom: 12px; max-width: none; }
 }

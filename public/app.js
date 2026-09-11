@@ -375,7 +375,9 @@ if (isRoomPage) {
   const myFiles  = new Map(); // fileId -> File (handles only, no bytes copied)
   const cards    = new Map(); // fileId -> card refs
   const incoming = new Map(); // peerId + ':' + tag -> transfer state
+  const receipts = new Map(); // chat msg id -> { ticks, acked, expected }
   const objectUrls = [];
+  let roomUsers = [];
   let tagSeq = 0;
 
   /* ── DOM ─────────────────────────────────────────────────── */
@@ -496,6 +498,7 @@ if (isRoomPage) {
   socket.on('room:users', renderUsers);
 
   function renderUsers(users) {
+    roomUsers = users;
     userListEl.innerHTML = users.map(u => {
       const self = u.label === myLabel;
       const peer = peers.get(u.id);
@@ -838,6 +841,17 @@ if (isRoomPage) {
         peer.creditRelay(msg.bytes || 0);
         break;
 
+      case 'got': {                  // a receiver confirmed the whole file
+        const card = cards.get(msg.fileId);
+        if (!card || !card.mine) return;
+        card.gotBy = card.gotBy || new Set();
+        card.gotBy.add(peer.label);
+        setCardState(msg.fileId, 'done',
+          '✓✓ Downloaded by ' + [...card.gotBy].join(', '));
+        card.el.classList.add('received');
+        break;
+      }
+
       case 'err': {
         const xfer = pendingRequests.get(msg.fileId) ||
           [...incoming.values()].find(x => x.fileId === msg.fileId);
@@ -1077,6 +1091,10 @@ if (isRoomPage) {
       const card2 = cards.get(xfer.fileId);
       if (card2) card2.bar.style.width = '100%';
       if (!xfer.auto) playDone();
+
+      // Tell the owner it actually landed, so their card can show a receipt.
+      const owner = peers.get(xfer.ownerId);
+      if (owner) owner.sendCtrl({ t: 'got', fileId: xfer.fileId });
     } catch (err) {
       abortIncoming(xfer, 'Could not finish saving: ' + (err.message || err));
     }
@@ -1166,6 +1184,23 @@ if (isRoomPage) {
     bubble.className = 'bubble';
     bubble.innerHTML = linkify(msg.text);
     row.appendChild(bubble);
+
+    if (mine && msg.id) {
+      // One tick: the server has it. Two: everyone in the room has it.
+      const ticks = document.createElement('span');
+      ticks.className = 'ticks';
+      ticks.textContent = '✓';
+      ticks.title = 'Sent';
+      bubble.appendChild(ticks);
+      receipts.set(msg.id, {
+        ticks,
+        acked: new Set(),
+        expected: Math.max(0, roomUsers.length - 1),
+      });
+      markReceipt(msg.id);
+    } else if (!mine && msg.id && msg.senderId) {
+      socket.emit('msg:ack', { id: msg.id, to: msg.senderId });
+    }
 
     const copy = document.createElement('button');
     copy.className = 'copy-btn';
@@ -1321,6 +1356,31 @@ if (isRoomPage) {
     }
     updateEmptyState();
   });
+
+  socket.on('msg:ack', ({ id, label }) => {
+    const r = receipts.get(id);
+    if (!r) return;
+    r.acked.add(label);
+    markReceipt(id);
+  });
+
+  function markReceipt(id) {
+    const r = receipts.get(id);
+    if (!r) return;
+    if (r.expected > 0 && r.acked.size >= r.expected) {
+      r.ticks.textContent = '✓✓';
+      r.ticks.classList.add('delivered');
+      r.ticks.title = 'Delivered to everyone in the room';
+    } else if (r.acked.size > 0) {
+      r.ticks.textContent = '✓✓';
+      r.ticks.classList.add('delivered');
+      r.ticks.title = 'Delivered to ' + [...r.acked].join(', ');
+    } else {
+      r.ticks.title = r.expected === 0
+        ? 'Sent — nobody else is here yet'
+        : 'Sent, not delivered yet';
+    }
+  }
 
   const typingUsers = new Map();
   socket.on('chat:typing', ({ label, typing }) => {

@@ -214,9 +214,23 @@ io.on('connection', (socket) => {
     if (typeof text !== 'string') return;
     const clean = text.slice(0, 4000);
     if (!clean.trim()) return;
-    const msg = { type: 'chat', sender: label, text: clean, ts: Date.now() };
+    const msg = {
+      type: 'chat',
+      id: Math.random().toString(36).slice(2) + Date.now().toString(36),
+      sender: label,
+      senderId: socket.id,
+      text: clean,
+      ts: Date.now(),
+    };
     pushHistory(rooms[code], msg);
     io.to(code).emit('chat:message', msg);
+  });
+
+  /* Delivery receipt: recipients confirm, the sender counts them. */
+  socket.on('msg:ack', (arg) => {
+    const { id, to } = arg || {};
+    if (!id || !inSameRoom(socket, to)) return;
+    io.to(to).emit('msg:ack', { id, from: socket.id, label: socket.data.label });
   });
 
   socket.on('chat:typing', (isTyping) => {
