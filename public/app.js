@@ -649,6 +649,24 @@ if (isRoomPage) {
       });
     }
 
+    /* Bytes handed over but not yet on the wire. Counting them as "sent"
+       would show 100% while the other side is still receiving. */
+    get inflight() {
+      if (this.mode === 'relay') return this.relayInflight;
+      return (this.dc && this.dc.bufferedAmount) || 0;
+    }
+
+    /* Resolves once the send buffer has actually drained. */
+    async drained(timeoutMs) {
+      const limit = timeoutMs || 180000;
+      const start = performance.now();
+      while (this.inflight > 0) {
+        if (this.mode !== 'relay' && (!this.dc || this.dc.readyState !== 'open')) return;
+        if (performance.now() - start > limit) return;
+        await new Promise(r => setTimeout(r, 60));
+      }
+    }
+
     creditRelay(bytes) {
       this.relayInflight = Math.max(0, this.relayInflight - bytes);
       if (this.relayInflight < RELAY_WINDOW) {
@@ -868,9 +886,20 @@ if (isRoomPage) {
         if (!card || !card.mine) return;
         card.gotBy = card.gotBy || new Set();
         card.gotBy.add(peer.label);
-        setCardState(msg.fileId, 'done',
-          '✓✓ Downloaded by ' + [...card.gotBy].join(', '));
-        card.el.classList.add('received');
+        if (card.peerRows && card.peerRows.has(peer.id)) {
+          const row = card.peerRows.get(peer.id);
+          row.state = 'got';
+          row.row.classList.add('done');
+          row.bar.style.width = '100%';
+          row.pct.textContent = '✓✓ saved';
+          // Everyone confirmed — settle the card without waiting on our buffer.
+          const busy = [...card.peerRows.values()].some(r => r.state === 'active');
+          if (!busy) {
+            setCardState(msg.fileId, 'done');
+            card.bar.style.width = '100%';
+          }
+        }
+        updateSenderSummary(card);
         break;
       }
 
@@ -991,9 +1020,17 @@ if (isRoomPage) {
     const progress = {
       fileId, size: file.size, sent: 0,
       startedAt: performance.now(), lastTick: performance.now(), lastBytes: 0,
-      direction: 'up', peerLabel: peer.label,
+      direction: 'up', peerId: peer.id, peerLabel: peer.label,
     };
-    setCardState(fileId, 'active', 'Sending to ' + peer.label + '…');
+
+    const ownCard = cards.get(fileId);
+    if (ownCard) {
+      const row = peerRow(ownCard, peer.id, peer.label);
+      row.state = 'active';
+      row.row.classList.remove('done');
+      setCardState(fileId, 'active');
+      updateSenderSummary(ownCard);
+    }
 
     // Read the next slice while the current one is in flight.
     let offset = 0;
@@ -1007,14 +1044,39 @@ if (isRoomPage) {
       }
       await peer.sendChunk(tag, new Uint8Array(buf));
       offset += advance;
-      progress.sent = offset;
+      progress.sent = Math.max(0, offset - peer.inflight); // only what has left
       tickProgress(progress);
     }
 
     peer.sendCtrl({ t: 'end', fileId, tag });
-    setCardState(fileId, 'done', 'Sent to ' + peer.label + ' · ' + formatSize(file.size));
+
+    // The loop finishes as soon as the last chunk is queued, which can be well
+    // before it reaches the other side. Keep reporting until the buffer empties.
+    while (peer.inflight > 0) {
+      progress.sent = Math.max(0, file.size - peer.inflight);
+      tickProgress(progress, true);
+      await Promise.race([peer.drained(), new Promise(r => setTimeout(r, 300))]);
+      if (peer.mode !== 'relay' && (!peer.dc || peer.dc.readyState !== 'open')) break;
+    }
+
     const card = cards.get(fileId);
-    if (card) card.bar.style.width = '100%';
+    if (card) {
+      const row = peerRow(card, peer.id, peer.label);
+      row.bar.style.width = '100%';
+      // Their receipt can land before our buffer finishes draining; never
+      // downgrade a confirmed save back to "sent".
+      if (row.state !== 'got') {
+        row.state = 'sent';
+        row.pct.textContent = 'sent';
+      }
+      // Only settle the whole card once nobody is still pulling it.
+      const busy = [...card.peerRows.values()].some(r => r.state === 'active');
+      if (!busy) {
+        setCardState(fileId, 'done');
+        card.bar.style.width = '100%';
+      }
+      updateSenderSummary(card);
+    }
   }
 
   function readSlice(file, offset, size) {
@@ -1135,27 +1197,110 @@ if (isRoomPage) {
   }
 
   /* ── Progress ────────────────────────────────────────────── */
-  function tickProgress(p) {
+  function tickProgress(p, force) {
     const card = cards.get(p.fileId);
     if (!card) return;
 
     const done = p.direction === 'up' ? p.sent : p.received;
     const total = p.size || 0;
     const pct = total ? Math.min(100, (done / total) * 100) : 0;
-    card.bar.style.width = pct.toFixed(1) + '%';
 
     const now = performance.now();
-    if (now - p.lastTick < 250) return;     // repaint ~4x a second
-    const speed = (done - p.lastBytes) / ((now - p.lastTick) / 1000);
-    p.lastTick = now;
-    p.lastBytes = done;
+    const due = force || now - p.lastTick >= 250;   // repaint ~4x a second
+    let speed = 0;
+    if (due) {
+      speed = (done - p.lastBytes) / ((now - p.lastTick) / 1000);
+      p.lastTick = now;
+      p.lastBytes = done;
+    }
 
+    // Outgoing transfers get one row per recipient, because several people can
+    // be pulling the same file at once and they do not share a progress line.
+    if (p.direction === 'up') {
+      const row = peerRow(card, p.peerId, p.peerLabel);
+      row.bar.style.width = pct.toFixed(1) + '%';
+      if (due) {
+        const eta = speed > 0 && total ? (total - done) / speed : Infinity;
+        row.pct.textContent = pct.toFixed(0) + '%' + (speed > 0 ? ' · ' + formatSpeed(speed) : '');
+        row.row.title = p.peerLabel + ' — ' + formatSize(done) + ' of ' + formatSize(total) +
+          (isFinite(eta) ? ' · ' + formatEta(eta) : '');
+        card.bar.style.width = furthestPeer(card).toFixed(1) + '%';
+        updateSenderSummary(card);
+      }
+      return;
+    }
+
+    card.bar.style.width = pct.toFixed(1) + '%';
+    if (!due) return;
     const eta = speed > 0 && total ? (total - done) / speed : Infinity;
-    const verb = p.direction === 'up' ? 'Sending' : 'Receiving';
     card.status.textContent =
-      verb + ' ' + pct.toFixed(0) + '% · ' + formatSize(done) + ' of ' + formatSize(total) +
+      'Receiving ' + pct.toFixed(0) + '% · ' + formatSize(done) + ' of ' + formatSize(total) +
       (speed > 0 ? ' · ' + formatSpeed(speed) : '') +
       (isFinite(eta) ? ' · ' + formatEta(eta) : '');
+  }
+
+  /* One row per recipient on your own card, created on first sight. */
+  function peerRow(card, peerId, label) {
+    card.peerRows = card.peerRows || new Map();
+    let row = card.peerRows.get(peerId);
+    if (row) return row;
+
+    const el = document.createElement('div');
+    el.className = 'peer-row';
+    el.innerHTML =
+      '<span class="peer-name"></span>' +
+      '<span class="peer-track"><span class="peer-bar"></span></span>' +
+      '<span class="peer-pct">0%</span>';
+    el.querySelector('.peer-name').textContent = label;
+
+    row = {
+      row: el,
+      label,
+      bar: el.querySelector('.peer-bar'),
+      pct: el.querySelector('.peer-pct'),
+      state: 'active',
+    };
+    card.peerRows.set(peerId, row);
+    if (card.peersEl) card.peersEl.appendChild(el);
+    return row;
+  }
+
+  function furthestPeer(card) {
+    let max = 0;
+    if (!card.peerRows) return max;
+    for (const r of card.peerRows.values()) {
+      max = Math.max(max, parseFloat(r.bar.style.width) || 0);
+    }
+    return max;
+  }
+
+  /* The headline summarises; the rows carry the detail. */
+  function updateSenderSummary(card) {
+    if (!card.mine || !card.peerRows || !card.peerRows.size) return;
+    const sending = [];
+    for (const r of card.peerRows.values()) {
+      if (r.state === 'active') sending.push(r.label);
+    }
+    if (sending.length) {
+      card.status.textContent = sending.length === 1
+        ? 'Sending to ' + sending[0] + '…'
+        : 'Sending to ' + sending.length + ' people…';
+      return;
+    }
+    const got = card.gotBy ? [...card.gotBy] : [];
+    const all = [...card.peerRows.values()].map(r => r.label);
+    if (got.length >= all.length) {
+      card.status.textContent = '✓✓ Downloaded by ' + got.join(', ');
+      card.el.classList.add('received');
+      return;
+    }
+    if (got.length) {
+      card.status.textContent =
+        '✓✓ Downloaded by ' + got.join(', ') +
+        ' · sent to ' + all.filter(n => !card.gotBy.has(n)).join(', ');
+      return;
+    }
+    card.status.textContent = 'Sent to ' + all.join(', ');
   }
 
   /* ── Message rendering ───────────────────────────────────── */
@@ -1254,6 +1399,7 @@ if (isRoomPage) {
         '</div>' +
       '</div>' +
       '<div class="file-track"><div class="file-bar"></div></div>' +
+      '<div class="file-peers"></div>' +
       '<div class="file-actions"></div>';
 
     row.appendChild(card);
@@ -1262,6 +1408,7 @@ if (isRoomPage) {
       meta, mine, el: card, row,
       status: card.querySelector('.file-status'),
       bar: card.querySelector('.file-bar'),
+      peersEl: card.querySelector('.file-peers'),
       actions: card.querySelector('.file-actions'),
       action: null,
       state: 'new',
