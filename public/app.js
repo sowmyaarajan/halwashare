@@ -340,15 +340,37 @@ function makeMemorySink(mime) {
   };
 }
 
+/* Chrome runs Safe Browsing over files written through the File System Access
+   API and rejects close() for executables it cannot vouch for — throwing away
+   everything already written. Those extensions skip the picker and take the
+   ordinary download route instead, where the browser offers Keep / Discard
+   rather than failing outright. */
+const RISKY_EXT =
+  /\.(exe|dll|msi|msp|bat|cmd|com|scr|pif|cpl|msc|hta|lnk|inf|sys|drv|ocx|reg|vbs|vbe|wsf|wsh|ps1|psm1|jar|apk|app|dmg|pkg|deb|rpm|iso|img|gadget)$/i;
+
+function isRiskyDownload(name) {
+  return RISKY_EXT.test(String(name || '').trim());
+}
+
+function describeSaveError(err) {
+  const msg = String((err && err.message) || err || '');
+  if (/safe.?browsing|blocked|dangerous/i.test(msg)) {
+    return 'Your browser blocked this file type. Ask the sender to zip it and send the zip instead.';
+  }
+  return 'Could not finish saving: ' + msg;
+}
+
 /* `preferMemory` is used for inline image previews, which we want to
    show in the page rather than save to disk. */
 async function createSink(name, size, mime, preferMemory) {
   if (!preferMemory) {
-    try {
-      const picker = await makePickerSink(name);
-      if (picker) return picker;
-    } catch (err) {
-      if (err && err.name === 'AbortError') throw err; // user cancelled — respect it
+    if (!isRiskyDownload(name)) {
+      try {
+        const picker = await makePickerSink(name);
+        if (picker) return picker;
+      } catch (err) {
+        if (err && err.name === 'AbortError') throw err; // user cancelled — respect it
+      }
     }
     const streamed = await makeStreamSink(name, size);
     if (streamed) return streamed;
@@ -869,7 +891,7 @@ if (isRoomPage) {
 
     xfer.received += byteLength;
     xfer.pending = (xfer.pending || Promise.resolve()).then(() => xfer.sink.write(view))
-      .catch(err => abortIncoming(xfer, 'Could not save: ' + (err.message || err)));
+      .catch(err => abortIncoming(xfer, describeSaveError(err)));
 
     if (peer.mode === 'relay') {
       xfer.sinceAck = (xfer.sinceAck || 0) + byteLength;
@@ -1040,7 +1062,7 @@ if (isRoomPage) {
       sink = await createSink(meta.name, meta.size, meta.fileType, options.preferMemory);
     } catch (err) {
       if (err && err.name === 'AbortError') return; // cancelled the dialog
-      return toast('Could not start the download: ' + (err.message || err), 'error');
+      return toast(describeSaveError(err), 'error');
     }
 
     const xfer = {
@@ -1096,7 +1118,7 @@ if (isRoomPage) {
       const owner = peers.get(xfer.ownerId);
       if (owner) owner.sendCtrl({ t: 'got', fileId: xfer.fileId });
     } catch (err) {
-      abortIncoming(xfer, 'Could not finish saving: ' + (err.message || err));
+      abortIncoming(xfer, describeSaveError(err));
     }
   }
 
