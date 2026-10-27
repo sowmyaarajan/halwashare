@@ -42,6 +42,8 @@ const RELAY_WINDOW     = 4 * 1024 * 1024; // unacknowledged bytes allowed on the
 const RELAY_ACK_EVERY  = 1 * 1024 * 1024;
 const P2P_GRACE        = 10000;           // ms before falling back to the relay
 const AUTO_PREVIEW_MAX = 5 * 1024 * 1024; // images this small arrive automatically
+const AUTO_PREVIEW_BUDGET = 60 * 1024 * 1024; // …until this much has arrived unasked
+const CODE_LENGTH      = 6;               // digits in a room code — matches server.js
 
 const isRoomPage = document.body.classList.contains('room-page');
 
@@ -197,9 +199,9 @@ if (!isRoomPage) {
   };
 
   inputCode.addEventListener('input', () => {
-    inputCode.value = inputCode.value.replace(/\D/g, '').slice(0, 4);
+    inputCode.value = inputCode.value.replace(/\D/g, '').slice(0, CODE_LENGTH);
     errorEl.classList.add('hidden');
-    if (inputCode.value.length === 4) doJoin();
+    if (inputCode.value.length === CODE_LENGTH) doJoin();
   });
   inputCode.addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin(); });
 
@@ -207,7 +209,13 @@ if (!isRoomPage) {
     btnCreate.disabled = true;
     btnCreate.textContent = 'Creating…';
     socket.emit('room:create', (res) => {
-      window.location.href = '/join/' + res.code;
+      if (res && res.code) {
+        window.location.href = '/join/' + res.code;
+        return;
+      }
+      showError((res && res.error) || 'Could not create a room. Try again.');
+      btnCreate.disabled = false;
+      btnCreate.textContent = 'Create a room';
     });
   });
 
@@ -217,7 +225,7 @@ if (!isRoomPage) {
   function doJoin() {
     if (joining) return;
     const code = inputCode.value.trim();
-    if (code.length !== 4) return showError('Enter the 4-digit room code.');
+    if (code.length !== CODE_LENGTH) return showError('Enter the ' + CODE_LENGTH + '-digit room code.');
     joining = true;
     btnJoin.disabled = true;
     btnJoin.textContent = 'Joining…';
@@ -464,15 +472,19 @@ if (isRoomPage) {
   }
 
   socket.on('connect', () => {
-    $('offline-banner').classList.add('hidden');
+    const banner = $('offline-banner');
+    if (banner) banner.classList.add('hidden');
     join();
   });
 
   socket.on('disconnect', () => {
-    $('offline-banner').classList.remove('hidden');
+    const banner = $('offline-banner');
+    if (banner) banner.classList.remove('hidden');
   });
 
+  // The page is gone after a fatal error, so stop reconnecting to it.
   function showFatal(message) {
+    socket.disconnect();
     document.body.innerHTML =
       '<div class="fatal">' +
         '<div class="fatal-card">' +
@@ -855,10 +867,12 @@ if (isRoomPage) {
 
       case 'start': {                // the owner is about to stream
         const xfer = pendingRequests.get(msg.fileId);
-        if (!xfer) return;
+        if (!xfer || xfer.ownerId !== peer.id) return; // only the owner may answer
+        if (!Number.isInteger(msg.tag)) return;
         pendingRequests.delete(msg.fileId);
         xfer.tag = msg.tag;
-        xfer.size = msg.size;
+        // xfer.size stays the size from the offer: the sender is held to what
+        // they advertised, so they cannot keep streaming until memory runs out.
         xfer.received = 0;
         xfer.startedAt = performance.now();
         xfer.lastTick = xfer.startedAt;
@@ -873,6 +887,17 @@ if (isRoomPage) {
         const xfer = incoming.get(peer.id + ':' + msg.tag);
         if (!xfer) return;
         incoming.delete(peer.id + ':' + msg.tag);
+        // Return the last partial megabyte of relay credit, or the sender
+        // waits forever for its buffer to drain and its queue stalls.
+        if (peer.mode === 'relay' && xfer.sinceAck) {
+          peer.sendCtrl({ t: 'ack', bytes: xfer.sinceAck });
+          xfer.sinceAck = 0;
+        }
+        if (xfer.received !== xfer.size) {
+          abortIncoming(xfer, 'Transfer incomplete — only ' + formatSize(xfer.received) +
+            ' of ' + formatSize(xfer.size) + ' arrived. Try again.');
+          break;
+        }
         finishIncoming(xfer);
         break;
       }
@@ -906,8 +931,9 @@ if (isRoomPage) {
       case 'err': {
         const xfer = pendingRequests.get(msg.fileId) ||
           [...incoming.values()].find(x => x.fileId === msg.fileId);
-        if (xfer) abortIncoming(xfer, msg.reason || 'Transfer failed');
-        else setCardState(msg.fileId, 'error', msg.reason || 'Transfer failed');
+        if (!xfer || xfer.ownerId !== peer.id) return;
+        for (const [key, x] of incoming) if (x === xfer) incoming.delete(key);
+        abortIncoming(xfer, String(msg.reason || 'Transfer failed').slice(0, 200));
         break;
       }
     }
@@ -919,6 +945,10 @@ if (isRoomPage) {
     if (!xfer) return;
 
     xfer.received += byteLength;
+    if (xfer.received > xfer.size) {
+      incoming.delete(key);
+      return abortIncoming(xfer, 'Transfer stopped — the sender sent more than the file size');
+    }
     xfer.pending = (xfer.pending || Promise.resolve()).then(() => xfer.sink.write(view))
       .catch(err => abortIncoming(xfer, describeSaveError(err)));
 
@@ -1094,9 +1124,7 @@ if (isRoomPage) {
     updateEmptyState();
 
     // Small images arrive on their own so pictures just appear, like a chat.
-    if (isImage(meta.fileType) && meta.size <= AUTO_PREVIEW_MAX) {
-      requestFile(meta, { preferMemory: true, auto: true });
-    }
+    if (wantsAutoPreview(meta)) requestFile(meta, { preferMemory: true, auto: true });
   });
 
   socket.on('file:unavailable', ({ fileId }) => {
@@ -1109,6 +1137,16 @@ if (isRoomPage) {
       if (card.action) card.action.disabled = true;
     }
   });
+
+  /* Pictures fetch themselves, but only real, small ones, and only up to a
+     budget — a flood of image offers must not fill this tab's memory. */
+  let autoBytes = 0;
+  function wantsAutoPreview(meta) {
+    if (!isImage(meta.fileType) || !(meta.size > 0) || meta.size > AUTO_PREVIEW_MAX) return false;
+    if (autoBytes + meta.size > AUTO_PREVIEW_BUDGET) return false;
+    autoBytes += meta.size;
+    return true;
+  }
 
   async function requestFile(meta, opts) {
     const options = opts || {};
@@ -1313,9 +1351,7 @@ if (isRoomPage) {
       if (entry.available) {
         setCardState(entry.fileId, 'ready', formatSize(entry.size) + ' · from ' + entry.sender);
         // Pictures shared before we arrived should still just appear.
-        if (isImage(entry.fileType) && entry.size <= AUTO_PREVIEW_MAX) {
-          requestFile(entry, { preferMemory: true, auto: true });
-        }
+        if (wantsAutoPreview(entry)) requestFile(entry, { preferMemory: true, auto: true });
       } else {
         setCardState(entry.fileId, 'gone', 'No longer available — sender left');
         const card = cards.get(entry.fileId);

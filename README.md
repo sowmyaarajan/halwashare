@@ -126,17 +126,48 @@ Also inherent to the design (ToffeeShare works the same way): the sender's tab
 must stay open and awake for the whole transfer. A phone that locks its screen
 mid-send will stall it.
 
+## Security
+
+HalwaShare has no accounts, so a room code is the only thing between a
+stranger and a room. The server is built to be safe on the open internet:
+
+| Threat | Defence |
+|---|---|
+| Guessing room codes | 6-digit random codes (900,000 possibilities); wrong guesses are limited to ~20 a minute per IP, and reconnecting does not reset that |
+| Flooding the server with rooms | Room creation limited per IP, at most `MAX_ROOMS_PER_IP` open per address, `MAX_ROOMS` in total; empty rooms expire after 2 minutes |
+| Malformed messages | Strict type checks, and every handler is guarded: a bad message drops that connection, never the server |
+| Exhausting memory | Chat history capped at 128 KB per room; a receiver that stops reading is not buffered for |
+| Floods of chat, signalling or relay bytes | Per-connection rate limits; relay bytes are paced (never dropped) and a sender ignoring flow control is disconnected |
+| Floods of pictures | Receivers auto-fetch only small images, up to 60 MB per visit; everything else waits for a click |
+| Too many connections | `MAX_CONN_PER_IP` open sockets per address |
+| Other websites driving a visitor's browser | Socket.io refuses connections whose `Origin` is not this site |
+| Script injection | Strict Content-Security-Policy, no inline script; all user text is escaped |
+| Tampering by someone in the room | Only a file's owner can withdraw it or answer for it; a receiver rejects more bytes than advertised, and incomplete files |
+
+Behind a proxy the server needs the real client address for those limits.
+On Render (Cloudflare's `CF-Connecting-IP`) and Fly (`Fly-Client-IP`) this is
+automatic. Elsewhere set `TRUST_PROXY=1`, and only when a proxy really sits in
+front, or clients could fake their address; if that proxy sets a client-IP
+header it overwrites, name it in `CLIENT_IP_HEADER`.
+
+Keep dependencies patched: `npm audit` should report 0 vulnerabilities.
+Run `npm test` after changing the server.
+
 ## Layout
 
 ```
-server.js         static hosting, signalling, chat, fallback relay
+server.js         static hosting, signalling, chat, fallback relay, limits
 public/app.js     peers, transports, sinks, transfer protocol, UI
 public/sw.js      streaming-download service worker
 public/style.css  light + dark theme
+test/             server tests — npm test
 ```
 
 Environment: `PORT` (default 4000), `MAX_USERS` (default 5), `PUBLIC_URL`,
-`TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL`.
+`TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL`, `MAX_ROOMS` (default 500),
+`MAX_ROOMS_PER_IP` (default 10),
+`MAX_CONN_PER_IP` (default 30), `ROOM_GRACE_MS` (default 120000),
+`RELAY_BYTES_PER_SEC` (default 16 MB/s), `TRUST_PROXY`, `CLIENT_IP_HEADER`.
 
 ## Protocol
 

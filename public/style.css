@@ -240,7 +240,7 @@ body.dark .btn-primary { color: #221a0c; }
   font-family: var(--mono);
   font-size: 22px;
   font-weight: 600;
-  letter-spacing: 8px;
+  letter-spacing: 5px;
   text-align: center;
   color: var(--text);
   background: var(--bg-tint);
@@ -248,7 +248,7 @@ body.dark .btn-primary { color: #221a0c; }
   border-radius: var(--r-sm);
   transition: border-color .18s ease, box-shadow .18s ease;
 }
-.code-input::placeholder { color: var(--text-dim); letter-spacing: 8px; }
+.code-input::placeholder { color: var(--text-dim); letter-spacing: 5px; }
 .code-input:focus {
   outline: none;
   border-color: var(--accent);
