@@ -1,4 +1,7 @@
-/* ── HalwaShare streaming-download service worker ──────────
+/* ── HalwaShare service worker ─────────────────────────────
+   Two jobs: streaming downloads (below) and the share target.
+
+   Streaming downloads ──
    Lets a browser without the File System Access API write an
    incoming file straight to disk instead of holding it in RAM.
 
@@ -70,9 +73,45 @@ self.addEventListener('message', (event) => {
   try { port.postMessage({ type: 'ready' }); } catch (_) {}
 });
 
+/* ── Share target ───────────────────────────────────────────
+   The installed app appears in the phone's Share menu. Shared files
+   arrive here as a form POST; we park them in Cache Storage (on disk,
+   so a 2 GB video does not sit in memory) and open the app, which
+   offers them as soon as the person enters a room. */
+const SHARE_CACHE = 'halwa-shared';
+
+async function receiveShare(request) {
+  try {
+    const form = await request.formData();
+    const files = form.getAll('files').filter(f => f && typeof f === 'object' && 'name' in f);
+    const text = [form.get('title'), form.get('text'), form.get('url')]
+      .filter(v => typeof v === 'string' && v.trim())
+      .filter((v, i, all) => all.indexOf(v) === i)
+      .join('\n');
+
+    await caches.delete(SHARE_CACHE);
+    const cache = await caches.open(SHARE_CACHE);
+    const names = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      names.push({ name: f.name || 'file', type: f.type || '' });
+      await cache.put('/__shared/' + i, new Response(f, { headers: { 'Content-Type': f.type || 'application/octet-stream' } }));
+    }
+    await cache.put('/__shared/index', new Response(JSON.stringify({ files: names, text, at: Date.now() }), {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+  } catch (_) { /* fall through: the app opens without the files */ }
+  return Response.redirect('/?shared=1', 303);
+}
+
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+
+  if (event.request.method === 'POST' && url.pathname === '/share-target') {
+    event.respondWith(receiveShare(event.request));
+    return;
+  }
 
   const match = url.pathname.match(/^\/__dl\/([A-Za-z0-9_-]+)$/);
   if (!match) return;

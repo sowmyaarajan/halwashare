@@ -333,3 +333,24 @@ test('the relay stops feeding a receiver that is not reading', async () => {
   assert.ok(queued < 12 * 1024 * 1024, 'server buffered ' + (queued / 1048576).toFixed(1) + ' MB for a stalled reader');
   b.io.engine.transport.ws._socket.resume();
 });
+
+test('the app is installable: manifest, icons, share target', async () => {
+  const res = await fetch(base + '/manifest.webmanifest');
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /manifest\+json/);
+  const m = await res.json();
+  assert.equal(m.display, 'standalone');
+  assert.equal(m.share_target.action, '/share-target');
+  for (const icon of m.icons) {
+    const r = await fetch(base + icon.src);
+    assert.equal(r.status, 200, icon.src);
+    assert.equal(r.headers.get('content-type'), 'image/png');
+  }
+  assert.ok(m.icons.some(i => i.purpose === 'maskable'));
+  assert.equal((await fetch(base + '/icons/apple-touch-icon.png')).status, 200);
+  const html = await (await fetch(base + '/')).text();
+  assert.match(html, /rel="manifest"/);
+  assert.match(html, /rel="apple-touch-icon"/);
+  const share = await fetch(base + '/share-target', { method: 'POST', redirect: 'manual' });
+  assert.equal(share.status, 303);
+});

@@ -11,6 +11,22 @@ npm start
 Open the printed **Network** URL on any device on the same Wi-Fi, or scan the QR
 code in the room sidebar.
 
+## Install it as an app
+
+HalwaShare is an installable web app, so it can live on the home screen
+instead of behind a link. It needs the HTTPS deployment.
+
+| Device | How |
+|---|---|
+| Android | Open the site in Chrome and tap **Install app** (or ⋮ → *Install app*) |
+| iPhone / iPad | Open the site in Safari, tap **Share** → **Add to Home Screen** |
+| Windows / Mac | Chrome or Edge: the install icon in the address bar, or the *Install the app* button |
+
+Once installed on Android, HalwaShare also appears in the **Share** menu:
+share photos from the gallery and they are offered the moment you enter a
+room. iPhone does not let web apps join its Share menu; use 📎 instead, and
+keep the app open while a transfer runs, as iOS pauses it in the background.
+
 ## How it works
 
 Picking a file **offers** it. Only the name and size are published, so sharing a
@@ -158,7 +174,8 @@ Run `npm test` after changing the server.
 ```
 server.js         static hosting, signalling, chat, fallback relay, limits
 public/app.js     peers, transports, sinks, transfer protocol, UI
-public/sw.js      streaming-download service worker
+public/sw.js      streaming downloads + share target
+public/manifest.webmanifest, public/icons/   the installable app
 public/style.css  light + dark theme
 test/             server tests — npm test
 ```

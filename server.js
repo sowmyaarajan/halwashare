@@ -254,6 +254,11 @@ app.get('/favicon.ico', (_req, res) => {
   );
 });
 
+/* The installed app's Share menu posts here. The service worker normally
+   answers it on the device; this only catches a share that arrives before
+   the worker is running, so the person lands on the app, not an error. */
+app.post('/share-target', (_req, res) => res.redirect(303, '/?shared=0'));
+
 app.get('/join/:code', (req, res) => {
   if (!CODE_RE.test(req.params.code)) return res.redirect('/');
   res.sendFile(path.join(__dirname, 'public', 'room.html'));

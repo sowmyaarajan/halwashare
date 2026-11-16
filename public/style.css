@@ -290,6 +290,38 @@ body.dark .btn-primary { color: #221a0c; }
   font-size: 12.5px;
 }
 
+/* ── Installed app: install prompt + files shared in from the phone ── */
+.install-box {
+  margin-top: 26px;
+  display: flex;
+  justify-content: center;
+}
+.install-hint {
+  max-width: 340px;
+  margin: 0;
+  padding: 10px 14px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-mid);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.share-pending {
+  width: 100%;
+  max-width: 420px;
+  margin-top: 18px;
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.45;
+  text-align: center;
+  color: var(--text);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--r);
+}
+
 /* ── Fatal error screen ───────────────────────────────────── */
 .fatal {
   min-height: 100vh;

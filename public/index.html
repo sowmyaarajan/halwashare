@@ -6,6 +6,13 @@
   <meta name="theme-color" content="#1d1917">
   <title>HalwaShare — send huge files, instantly</title>
   <link rel="icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="HalwaShare">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -40,6 +47,8 @@
         <p id="landing-error" class="error-text hidden" role="alert"></p>
       </div>
 
+      <div id="share-pending" class="share-pending hidden" role="status"></div>
+
       <ul class="features">
         <li><span>⚡</span><div><strong>No size limit</strong>Huge files stream straight to disk</div></li>
         <li><span>🔒</span><div><strong>Peer to peer</strong>Encrypted, never stored on a server</div></li>
@@ -47,6 +56,13 @@
         <li><span>📱</span><div><strong>Scan to join</strong>Phone to laptop in one tap</div></li>
       </ul>
     </main>
+
+    <div id="install-box" class="install-box hidden">
+      <button id="btn-install" class="btn btn-secondary btn-sm hidden" type="button">📲 Install the app</button>
+      <p id="install-ios" class="install-hint hidden">
+        📲 Install on iPhone: in Safari tap <strong>Share</strong> (the square with an arrow), then <strong>Add to Home Screen</strong>.
+      </p>
+    </div>
 
     <footer class="landing-foot">Works best when everyone is on the same Wi-Fi.</footer>
   </div>

@@ -181,6 +181,58 @@ function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+/* ── Service worker ────────────────────────────────────────────
+   Registered on every page: the installed app opens on the landing
+   page, and that is where shared files arrive. */
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+
+/* ── Files shared in from the phone's Share menu ───────────────
+   sw.js parks them in Cache Storage. The landing page shows them and
+   arms this tab; the room page offers them once, then forgets them.
+   Arming per tab means an old share never ambushes a later room. */
+const SHARE_CACHE = 'halwa-shared';
+const SHARE_MAX_AGE = 60 * 60 * 1000;
+const SHARE_ARMED = 'halwa-share-armed';
+
+async function readSharedIndex() {
+  if (!('caches' in window)) return null;
+  try {
+    const cache = await caches.open(SHARE_CACHE);
+    const res = await cache.match('/__shared/index');
+    if (!res) return null;
+    const index = await res.json();
+    if (!index || Date.now() - index.at > SHARE_MAX_AGE) { await clearShared(); return null; }
+    if (!(index.files || []).length && !index.text) return null;
+    return index;
+  } catch (_) { return null; }
+}
+
+async function takeShared() {
+  const index = await readSharedIndex();
+  if (!index) return null;
+  const cache = await caches.open(SHARE_CACHE);
+  const files = [];
+  for (let i = 0; i < index.files.length; i++) {
+    const res = await cache.match('/__shared/' + i);
+    if (!res) continue;
+    const blob = await res.blob();
+    files.push(new File([blob], index.files[i].name, { type: index.files[i].type }));
+  }
+  await clearShared();
+  return { files, text: index.text || '' };
+}
+
+async function clearShared() {
+  try { await caches.delete(SHARE_CACHE); } catch (_) {}
+}
+
+function isStandalone() {
+  return window.navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches;
+}
+
 /* ── Landing page ──────────────────────────────────────────── */
 if (!isRoomPage) {
   const socket    = io();
@@ -221,6 +273,53 @@ if (!isRoomPage) {
 
   btnJoin.addEventListener('click', doJoin);
 
+  /* Files shared from another app wait here until a room is chosen. */
+  readSharedIndex().then((index) => {
+    if (!index) return;
+    try { sessionStorage.setItem(SHARE_ARMED, '1'); } catch (_) {}
+    const n = index.files.length;
+    const what = n
+      ? n + (n === 1 ? ' file' : ' files') + ' (' +
+        index.files.slice(0, 3).map(f => f.name).join(', ') + (n > 3 ? ', …' : '') + ')'
+      : 'Your text';
+    const el = document.getElementById('share-pending');
+    el.textContent = '📎 ' + what + ' ready to send. Create or join a room and ' +
+      (n === 1 || !n ? 'it' : 'they') + '’ll be shared there.';
+    el.classList.remove('hidden');
+    if (location.search) history.replaceState(null, '', '/');
+  });
+
+  /* Install: Chrome and Edge hand us a prompt to show on a click.
+     iPhone has no prompt, so it gets instructions instead. */
+  const installBox = document.getElementById('install-box');
+  const btnInstall = document.getElementById('btn-install');
+  let installPrompt = null;
+
+  if (!isStandalone()) {
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      installPrompt = e;
+      btnInstall.classList.remove('hidden');
+      installBox.classList.remove('hidden');
+    });
+    const iOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (iOS) {
+      document.getElementById('install-ios').classList.remove('hidden');
+      installBox.classList.remove('hidden');
+    }
+  }
+
+  btnInstall.addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => {});
+    installPrompt = null;
+    installBox.classList.add('hidden');
+  });
+
+  window.addEventListener('appinstalled', () => installBox.classList.add('hidden'));
+
   let joining = false;
   function doJoin() {
     if (joining) return;
@@ -250,12 +349,6 @@ if (!isRoomPage) {
      disk-stream : service worker stream — true streaming, any size
      memory      : Blob in RAM — the last resort, fine for small files  */
 
-let swRegistration = null;
-if (isRoomPage && 'serviceWorker' in navigator && window.isSecureContext) {
-  navigator.serviceWorker.register('/sw.js')
-    .then(reg => { swRegistration = reg; })
-    .catch(() => {});
-}
 
 function canStreamToDisk() {
   if (window.isSecureContext && typeof window.showSaveFilePicker === 'function') return true;
@@ -464,6 +557,7 @@ if (isRoomPage) {
         loadQR(urlCode);
         res.history.forEach(renderHistoryEntry);
         showCapabilityNote();
+        offerSharedFiles();
       }
       // Peers already here will send us their offers.
       res.peers.forEach(p => ensurePeer(p.id, p.label));
@@ -493,6 +587,22 @@ if (isRoomPage) {
           '<a href="/" class="btn btn-primary">Back to start</a>' +
         '</div>' +
       '</div>';
+  }
+
+  async function offerSharedFiles() {
+    let armed = false;
+    try { armed = sessionStorage.getItem(SHARE_ARMED) === '1'; sessionStorage.removeItem(SHARE_ARMED); } catch (_) {}
+    if (!armed) return;
+    const shared = await takeShared();
+    if (!shared) return;
+    shared.files.forEach(offerFile);
+    if (shared.text) {
+      msgInput.value = shared.text.slice(0, 4000);
+      msgInput.focus();
+    }
+    if (shared.files.length) {
+      toast('Shared ' + shared.files.length + (shared.files.length === 1 ? ' file' : ' files') + ' with the room');
+    }
   }
 
   function showCapabilityNote() {
