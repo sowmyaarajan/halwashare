@@ -152,7 +152,7 @@ stranger and a room. The server is built to be safe on the open internet:
 
 | Threat | Defence |
 |---|---|
-| Guessing room codes | 6-digit random codes (900,000 possibilities); wrong guesses are limited to ~20 a minute per address (a whole IPv6 /64 counts as one), and reconnecting does not reset that. A site-wide cap of `GLOBAL_MISSES_PER_MIN` (default 300) stops guesses spread over many addresses |
+| Guessing room codes | 6-digit random codes (900,000 possibilities); wrong guesses are limited to ~20 a minute per address (a whole IPv6 /64 counts as one), and reconnecting does not reset that. A site-wide cap of `GLOBAL_MISSES_PER_MIN` (default 300) stops guesses spread over many addresses; people already in a room get back in even while it is spent |
 | Flooding the server with rooms | Room creation limited per IP, at most `MAX_ROOMS_PER_IP` open per address, `MAX_ROOMS` in total; empty rooms expire after 2 minutes |
 | Malformed messages | Strict type checks, and every handler is guarded: a bad message drops that connection, never the server |
 | Exhausting memory | Chat history capped at 128 KB per room; a receiver that stops reading is not buffered for |
