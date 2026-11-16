@@ -273,9 +273,13 @@ if (!isRoomPage) {
 
   btnJoin.addEventListener('click', doJoin);
 
-  /* Files shared from another app wait here until a room is chosen. */
+  /* Files shared from another app wait here until a room is chosen.
+     The phone's Share menu always opens the installed app; a website
+     that forged a share can only open an ordinary tab. Outside the app,
+     whatever is parked is thrown away unseen. */
   readSharedIndex().then((index) => {
     if (!index) return;
+    if (!isStandalone()) { clearShared(); return; }
     try { sessionStorage.setItem(SHARE_ARMED, '1'); } catch (_) {}
     const n = index.files.length;
     const what = n
@@ -283,8 +287,8 @@ if (!isRoomPage) {
         index.files.slice(0, 3).map(f => f.name).join(', ') + (n > 3 ? ', …' : '') + ')'
       : 'Your text';
     const el = document.getElementById('share-pending');
-    el.textContent = '📎 ' + what + ' ready to send. Create or join a room and ' +
-      (n === 1 || !n ? 'it' : 'they') + '’ll be shared there.';
+    el.textContent = '📎 ' + what + ' ready. Create or join a room, and you can send ' +
+      (n === 1 || !n ? 'it' : 'them') + ' from there.';
     el.classList.remove('hidden');
     if (location.search) history.replaceState(null, '', '/');
   });
@@ -590,19 +594,61 @@ if (isRoomPage) {
   }
 
   async function offerSharedFiles() {
+    if (!isStandalone()) return;
     let armed = false;
     try { armed = sessionStorage.getItem(SHARE_ARMED) === '1'; sessionStorage.removeItem(SHARE_ARMED); } catch (_) {}
     if (!armed) return;
     const shared = await takeShared();
     if (!shared) return;
-    shared.files.forEach(offerFile);
+    // Text lands in the composer, where sending it is already a choice.
     if (shared.text) {
       msgInput.value = shared.text.slice(0, 4000);
       msgInput.focus();
     }
-    if (shared.files.length) {
-      toast('Shared ' + shared.files.length + (shared.files.length === 1 ? ' file' : ' files') + ' with the room');
-    }
+    if (shared.files.length) confirmShared(shared.files);
+  }
+
+  /* Shared files are shown, never sent unasked: the person sees exactly
+     what is about to go out under their name, and chooses. */
+  function confirmShared(files) {
+    const bar = document.createElement('div');
+    bar.className = 'share-confirm';
+    bar.setAttribute('role', 'dialog');
+    bar.setAttribute('aria-label', 'Send shared files');
+
+    const title = document.createElement('p');
+    title.className = 'share-confirm-title';
+    title.textContent = 'Send ' + (files.length === 1 ? 'this file' : 'these ' + files.length + ' files') + ' to the room?';
+
+    const list = document.createElement('ul');
+    list.className = 'share-confirm-list';
+    files.forEach(f => {
+      const li = document.createElement('li');
+      li.textContent = fileIcon(f.type, f.name) + ' ' + f.name + ' · ' + formatSize(f.size);
+      list.appendChild(li);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const discard = document.createElement('button');
+    discard.type = 'button';
+    discard.className = 'btn btn-ghost btn-sm';
+    discard.textContent = 'Discard';
+    const send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'btn btn-primary btn-sm';
+    send.textContent = 'Send';
+    actions.append(discard, send);
+
+    bar.append(title, list, actions);
+    document.querySelector('.composer').before(bar);
+    send.focus();
+
+    discard.addEventListener('click', () => bar.remove());
+    send.addEventListener('click', () => {
+      bar.remove();
+      files.forEach(offerFile);
+    });
   }
 
   function showCapabilityNote() {

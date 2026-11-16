@@ -308,6 +308,28 @@ body.dark .btn-primary { color: #221a0c; }
   border: 1px solid var(--line);
   border-radius: var(--r);
 }
+/* Shared files wait here for a yes before anything is offered. */
+.share-confirm {
+  margin: 0 14px 10px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1.5px solid var(--accent);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+}
+.share-confirm-title { margin: 0 0 6px; font-weight: 600; font-size: 14px; }
+.share-confirm-list {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+  max-height: 120px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: var(--text-mid);
+}
+.share-confirm-list li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 0; }
+.share-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 .share-pending {
   width: 100%;
   max-width: 420px;

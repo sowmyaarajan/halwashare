@@ -23,8 +23,9 @@ instead of behind a link. It needs the HTTPS deployment.
 | Windows / Mac | Chrome or Edge: the install icon in the address bar, or the *Install the app* button |
 
 Once installed on Android, HalwaShare also appears in the **Share** menu:
-share photos from the gallery and they are offered the moment you enter a
-room. iPhone does not let web apps join its Share menu; use 📎 instead, and
+share photos from the gallery, enter a room, and HalwaShare lists them and
+asks before sending. Shares are only accepted inside the installed app, so a
+website cannot plant files for you to send. iPhone does not let web apps join its Share menu; use 📎 instead, and
 keep the app open while a transfer runs, as iOS pauses it in the background.
 
 ## How it works

@@ -80,7 +80,19 @@ self.addEventListener('message', (event) => {
    offers them as soon as the person enters a room. */
 const SHARE_CACHE = 'halwa-shared';
 
+/* Any website can auto-submit a hidden form here and try to plant a file
+   for the person to share later. A real share comes from the operating
+   system with no referrer; a form on another site carries that site's,
+   unless it hides it. So this only stops the careless attacker — the page
+   also refuses shares outside the installed app, and the room always asks
+   before sending. */
+function isGenuineShare(request) {
+  if (!request.referrer) return true;
+  try { return new URL(request.referrer).origin === self.location.origin; } catch (_) { return false; }
+}
+
 async function receiveShare(request) {
+  if (!isGenuineShare(request)) return Response.redirect('/', 303);
   try {
     const form = await request.formData();
     const files = form.getAll('files').filter(f => f && typeof f === 'object' && 'name' in f);
@@ -94,7 +106,7 @@ async function receiveShare(request) {
     const names = [];
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
-      names.push({ name: f.name || 'file', type: f.type || '' });
+      names.push({ name: f.name || 'file', type: f.type || '', size: f.size || 0 });
       await cache.put('/__shared/' + i, new Response(f, { headers: { 'Content-Type': f.type || 'application/octet-stream' } }));
     }
     await cache.put('/__shared/index', new Response(JSON.stringify({ files: names, text, at: Date.now() }), {
