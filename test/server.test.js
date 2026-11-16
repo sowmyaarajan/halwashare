@@ -369,6 +369,13 @@ test('one IPv6 /64 shares a single guessing budget', async () => {
 
 // Keep this last: it spends the site-wide budget.
 test('wrong guesses spread over many addresses hit a site-wide cap', async () => {
+  // A room someone was already in before the attack starts.
+  const host = await connected(client({ ip: '10.67.0.1' }));
+  const { code } = await call(host, 'room:create', { clientId: 'creator-secret-0001' });
+  const member = await connected(client({ ip: '10.67.0.2' }));
+  assert.ok((await call(member, 'room:join', { code, clientId: 'member-secret-00001' })).selfId);
+  member.close();
+
   let busy = 0;
   for (let n = 0; n < 12; n++) {
     const s = await connected(client({ ip: '10.66.' + n + '.1' }));
@@ -379,4 +386,13 @@ test('wrong guesses spread over many addresses hit a site-wide cap', async () =>
     s.close();
   }
   assert.ok(busy >= 30, 'only ' + busy + ' of 168 spread-out guesses were refused');
+
+  // The cap is spent, yet the people who belong still get in...
+  const back = await connected(client({ ip: '10.67.0.3' }));
+  assert.ok((await call(back, 'room:join', { code, clientId: 'member-secret-00001' })).selfId, 'returning member refused');
+  const creator = await connected(client({ ip: '10.67.0.4' }));
+  assert.ok((await call(creator, 'room:join', { code, clientId: 'creator-secret-0001' })).selfId, 'creator refused');
+  // ...while a stranger who has the right code but not a member's id does not.
+  const stranger = await connected(client({ ip: '10.67.0.5' }));
+  assert.match((await call(stranger, 'room:join', { code, clientId: 'stranger-guess-0001' })).error, /busy/);
 });

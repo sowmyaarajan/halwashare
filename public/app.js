@@ -178,7 +178,22 @@ function copyText(text) {
 }
 
 function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  // Unguessable: a device's id lets it back into its room without the
+  // code-guessing limits, so it must not be predictable.
+  const b = crypto.getRandomValues(new Uint8Array(15));
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+/* This tab's identity, shared by the landing page and the room. */
+function getClientId() {
+  try {
+    let id = sessionStorage.getItem('halwa-client');
+    if (!id || !/^[A-Za-z0-9_-]{16,64}$/.test(id)) {
+      id = uid();
+      sessionStorage.setItem('halwa-client', id);
+    }
+    return id;
+  } catch (_) { return uid(); }
 }
 
 /* ── Service worker ────────────────────────────────────────────
@@ -260,7 +275,7 @@ if (!isRoomPage) {
   btnCreate.addEventListener('click', () => {
     btnCreate.disabled = true;
     btnCreate.textContent = 'Creating…';
-    socket.emit('room:create', (res) => {
+    socket.emit('room:create', { clientId: getClientId() }, (res) => {
       if (res && res.code) {
         window.location.href = '/join/' + res.code;
         return;
@@ -488,11 +503,7 @@ if (isRoomPage) {
   const socket  = io({ reconnectionDelayMax: 4000 });
   const urlCode = window.location.pathname.split('/').pop();
 
-  let clientId;
-  try {
-    clientId = sessionStorage.getItem('halwa-client') || uid();
-    sessionStorage.setItem('halwa-client', clientId);
-  } catch (_) { clientId = uid(); }
+  const clientId = getClientId();
 
   let myLabel = null;
   let mySocketId = null;

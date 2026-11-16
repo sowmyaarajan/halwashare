@@ -95,6 +95,15 @@ function userList(room) {
   return room.users.map(u => ({ id: u.id, label: u.label }));
 }
 
+/* Client ids that have joined this room, so they can return without the
+   guessing gates. Capped: at most five people are in a room at once, and a
+   few more for those who left. */
+function rememberMember(room, clientId) {
+  room.members.delete(clientId);
+  room.members.add(clientId);
+  while (room.members.size > 20) room.members.delete(room.members.values().next().value);
+}
+
 function scheduleExpiry(room) {
   clearTimeout(room.expiry);
   room.expiry = setTimeout(() => {
@@ -378,8 +387,15 @@ io.on('connection', (socket) => {
   /* A code that misses counts against the IP; one that hits does not, so
      people who know their code are never slowed down. Lookups are refused
      outright once the budget is spent, hit or miss. */
-  function lookup(code) {
+  function lookup(code, clientId) {
     if (typeof code !== 'string' || !CODE_RE.test(code)) return { error: 'Room codes are ' + CODE_LENGTH + ' digits.' };
+    // Someone who has already been in this room — a phone reconnecting after
+    // its screen locked, a refresh — is let straight back in, even while the
+    // site-wide guessing cap is spent. Their id is a random secret never sent
+    // to anyone else, so knowing it proves they belong; a guesser has neither
+    // the code nor the id.
+    const known = rooms[code];
+    if (known && typeof clientId === 'string' && known.members.has(clientId)) return { room: known };
     const bucket = ipBucket(ip, 'lookup');
     bucket.take(0); // refill
     globalMisses.take(0);
@@ -390,7 +406,8 @@ io.on('connection', (socket) => {
     return { room };
   }
 
-  on('room:create', (cb) => {
+  on('room:create', (arg, cb) => {
+    if (typeof arg === 'function') { cb = arg; arg = null; }
     if (typeof cb !== 'function') return;
     if (!ipBucket(ip, 'create').take(1)) return cb({ error: SLOW_DOWN });
     const codes = Object.keys(rooms);
@@ -402,8 +419,11 @@ io.on('connection', (socket) => {
     }
     const code = generateCode();
     if (!code) return cb({ error: 'HalwaShare is busy right now. Please try again in a few minutes.' });
-    const room = { code, users: [], history: [], historyBytes: 0, expiry: null, ownerIp: ip };
+    const room = { code, users: [], history: [], historyBytes: 0, expiry: null, ownerIp: ip, members: new Set() };
     rooms[code] = room;
+    // The creator's tab goes straight on to join; let it in whatever the
+    // guessing budget says.
+    if (arg && typeof arg.clientId === 'string' && ID_RE.test(arg.clientId)) rememberMember(room, arg.clientId);
     scheduleExpiry(room);
     cb({ code });
   });
@@ -425,7 +445,7 @@ io.on('connection', (socket) => {
       return reply({ error: 'Bad request.' });
     }
 
-    const { room, error } = lookup(code);
+    const { room, error } = lookup(code, clientId);
     if (error) return reply({ error });
     if (!room) return reply({ error: 'No room with that code. It may have closed when everyone left.' });
 
@@ -444,6 +464,7 @@ io.on('connection', (socket) => {
       room.users.push({ id: socket.id, clientId: clientId || socket.id, label });
     }
     clearTimeout(room.expiry);
+    if (clientId) rememberMember(room, clientId);
 
     socket.join(code);
     socket.data.code = code;
