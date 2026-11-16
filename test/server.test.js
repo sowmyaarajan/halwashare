@@ -6,6 +6,7 @@
 process.env.TRUST_PROXY = '1';
 process.env.ROOM_GRACE_MS = '300';
 process.env.MAX_ROOMS = '40';
+process.env.GLOBAL_MISSES_PER_MIN = '120';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -353,4 +354,29 @@ test('the app is installable: manifest, icons, share target', async () => {
   assert.match(html, /rel="apple-touch-icon"/);
   const share = await fetch(base + '/share-target', { method: 'POST', redirect: 'manual' });
   assert.equal(share.status, 303);
+});
+
+test('one IPv6 /64 shares a single guessing budget', async () => {
+  const a = await connected(client({ ip: '2001:db8:5:6::1' }));
+  for (let i = 0; i < 16; i++) await call(a, 'room:check', { code: String(200000 + i) });
+  // Another address in the same /64 — the same household — is already limited...
+  const b = await connected(client({ ip: '2001:db8:5:6:ffff:1:2:3' }));
+  assert.match((await call(b, 'room:check', { code: '299999' })).error, /Too many/);
+  // ...but the next /64 over is someone else.
+  const c = await connected(client({ ip: '2001:db8:5:7::1' }));
+  assert.deepEqual(await call(c, 'room:check', { code: '299998' }), { error: 'No room with that code. Check the digits and try again.' });
+});
+
+// Keep this last: it spends the site-wide budget.
+test('wrong guesses spread over many addresses hit a site-wide cap', async () => {
+  let busy = 0;
+  for (let n = 0; n < 12; n++) {
+    const s = await connected(client({ ip: '10.66.' + n + '.1' }));
+    for (let i = 0; i < 14; i++) {
+      const r = await call(s, 'room:check', { code: String(300000 + n * 100 + i) });
+      if (/busy/.test(r.error || '')) busy++;
+    }
+    s.close();
+  }
+  assert.ok(busy >= 30, 'only ' + busy + ' of 168 spread-out guesses were refused');
 });

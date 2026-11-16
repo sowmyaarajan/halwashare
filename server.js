@@ -146,6 +146,15 @@ class Bucket {
   }
 }
 
+/* Wrong guesses from everyone together. Per-address limits alone fall to an
+   attacker spread over many addresses; this caps the whole site at about
+   300 misses a minute, so even a botnet needs days to find one room. While it
+   is spent, lookups are refused for everyone — a brief nuisance, where a
+   found room would expose people's files. */
+const globalMisses = new Bucket(
+  Number(process.env.GLOBAL_MISSES_PER_MIN || 300) / 60,
+  Number(process.env.GLOBAL_MISSES_PER_MIN || 300));
+
 const LIMITS = {
   create:  [1 / 6, 10],          // ~10 rooms a minute per IP
   lookup:  [1 / 3, 15],          // failed code lookups per IP — the guessing guard
@@ -207,12 +216,29 @@ function clientIP(req) {
     const h = req.headers;
     if (CLIENT_IP_HEADER) {
       const v = h[CLIENT_IP_HEADER];
-      if (typeof v === 'string' && v) return v.trim();
+      if (typeof v === 'string' && v) return ipKey(v.trim());
     }
     const fwd = h['x-forwarded-for'];
-    if (typeof fwd === 'string' && fwd) return fwd.split(',').pop().trim();
+    if (typeof fwd === 'string' && fwd) return ipKey(fwd.split(',').pop().trim());
   }
-  return (req.socket && req.socket.remoteAddress) || 'unknown';
+  return ipKey((req.socket && req.socket.remoteAddress) || 'unknown');
+}
+
+/* The key every per-address limit is counted against. One home connection or
+   phone is handed a whole IPv6 /64 — 18 quintillion addresses — so limiting
+   single IPv6 addresses would limit nothing. Count the /64 instead. */
+function ipKey(ip) {
+  const v4 = /^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (v4) return v4[1];
+  if (!ip.includes(':')) return ip;
+  const addr = ip.split('%')[0].toLowerCase();       // drop a zone id
+  const [head, tail = ''] = addr.split('::');
+  const h = head ? head.split(':') : [];
+  const t = addr.includes('::') && tail ? tail.split(':') : [];
+  const groups = addr.includes('::')
+    ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t]
+    : h;
+  return groups.slice(0, 4).map(g => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
 }
 
 /* ── HTTP ──────────────────────────────────────────────────── */
@@ -356,9 +382,11 @@ io.on('connection', (socket) => {
     if (typeof code !== 'string' || !CODE_RE.test(code)) return { error: 'Room codes are ' + CODE_LENGTH + ' digits.' };
     const bucket = ipBucket(ip, 'lookup');
     bucket.take(0); // refill
+    globalMisses.take(0);
     if (bucket.tokens < 1) return { error: SLOW_DOWN };
+    if (globalMisses.tokens < 1) return { error: 'HalwaShare is busy. Try again in a minute.' };
     const room = rooms[code];
-    if (!room) bucket.take(1);
+    if (!room) { bucket.take(1); globalMisses.take(1); }
     return { room };
   }
 
@@ -478,8 +506,8 @@ io.on('connection', (socket) => {
         return;
       }
       relayQueue.shift();
+      relayQueued -= item.cost;
       if (item.buf) {
-        relayQueued -= item.buf.length;
         io.to(item.to).emit('relay:chunk', { from: socket.id, tag: item.tag, buf: item.buf });
       } else {
         io.to(item.to).emit('relay:ctrl', { from: socket.id, msg: item.msg });
@@ -495,8 +523,15 @@ io.on('connection', (socket) => {
   on('relay:ctrl', (arg) => {
     const { to, msg } = arg || {};
     if (!inSameRoom(socket, to) || !msg || typeof msg !== 'object') return;
-    if (!allow('ctrl') || byteSize(msg) > MAX_CTRL_BYTES) return;
-    queueRelay({ to, msg });
+    const size = byteSize(msg);
+    if (!allow('ctrl') || size > MAX_CTRL_BYTES) return;
+    // Counted like chunk bytes, so a stalled receiver cannot make the server
+    // hoard an endless pile of small messages either. The floor covers the
+    // per-message overhead of a tiny one.
+    const cost = Math.max(size, 256);
+    if (relayQueued + cost > MAX_RELAY_BACKLOG) return socket.disconnect(true);
+    relayQueued += cost;
+    queueRelay({ to, msg, cost });
   });
 
   on('relay:chunk', (arg) => {
@@ -506,7 +541,7 @@ io.on('connection', (socket) => {
     if (buf.length > MAX_RELAY_CHUNK) return;
     if (relayQueued + buf.length > MAX_RELAY_BACKLOG) return socket.disconnect(true);
     relayQueued += buf.length;
-    queueRelay({ to, tag, buf });
+    queueRelay({ to, tag, buf, cost: buf.length });
   });
 
   on('disconnect', () => clearTimeout(relayTimer));
