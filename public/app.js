@@ -1016,9 +1016,13 @@ if (isRoomPage) {
 
     switch (msg.t) {
       case 'req':                    // someone wants a file we offered
-        peer.enqueue(() => serveFile(peer, msg.fileId).catch(err => {
-          peer.sendCtrl({ t: 'err', fileId: msg.fileId, reason: String(err.message || err) });
-        }));
+        peer.enqueue(() => {
+          activeSends++;
+          syncWakeLock();
+          return serveFile(peer, msg.fileId).catch(err => {
+            peer.sendCtrl({ t: 'err', fileId: msg.fileId, reason: String(err.message || err) });
+          }).finally(() => { activeSends--; syncWakeLock(); });
+        });
         break;
 
       case 'start': {                // the owner is about to stream
@@ -1328,6 +1332,7 @@ if (isRoomPage) {
       startedAt: performance.now(), lastTick: performance.now(), lastBytes: 0,
     };
     pendingRequests.set(meta.fileId, xfer);
+    syncWakeLock();
     setCardState(meta.fileId, 'active', 'Connecting…');
 
     const peer = ensurePeer(meta.ownerId);
@@ -1774,8 +1779,46 @@ if (isRoomPage) {
     if (nearBottom) requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
   }
 
+  /* ── Keep the screen awake while bytes move ──────────────────
+     A phone that dims and locks mid-transfer suspends the page and the
+     transfer stalls, on both the sending and the receiving side. Hold a
+     screen wake lock while anything is in flight. The browser drops the
+     lock whenever the page is hidden, so take it again on return. */
+  let activeSends = 0;
+  let wakeLock = null;
+  let wakeLockPending = false;
+
+  function isTransferring() {
+    return activeSends > 0 || incoming.size > 0 || pendingRequests.size > 0;
+  }
+
+  async function syncWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    const want = isTransferring() && document.visibilityState === 'visible';
+    if (want && !wakeLock && !wakeLockPending) {
+      wakeLockPending = true;
+      try {
+        const lock = await navigator.wakeLock.request('screen');
+        wakeLock = lock;
+        lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
+        // The transfer may have finished while we waited for the lock.
+        if (!isTransferring()) syncWakeLock();
+      } catch (_) { /* low battery, or not allowed: the transfer still runs */ }
+      wakeLockPending = false;
+    } else if (!want && wakeLock) {
+      const lock = wakeLock;
+      wakeLock = null;
+      try { await lock.release(); } catch (_) {}
+    }
+  }
+
+  document.addEventListener('visibilitychange', syncWakeLock);
+  // incoming and pendingRequests change in many places; checking every
+  // couple of seconds is cheaper than hooking each one and never misses.
+  setInterval(syncWakeLock, 2000);
+
   window.addEventListener('beforeunload', (e) => {
-    const busy = incoming.size > 0 || pendingRequests.size > 0;
+    const busy = isTransferring();
     if (busy) {
       e.preventDefault();
       e.returnValue = '';
