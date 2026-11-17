@@ -1,6 +1,6 @@
 {
   "name": "halwashare",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Peer-to-peer chat and unlimited-size file sharing for the people around you",
   "main": "server.js",
   "scripts": {

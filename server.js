@@ -282,6 +282,7 @@ app.use((req, res, next) => {
       "script-src 'self'",
       "style-src 'self'",
       "img-src 'self' data: blob:",
+      "media-src 'self' blob:",
       "connect-src 'self' ws://" + host + ' wss://' + host,
       "frame-src 'self'",
       "worker-src 'self'",
@@ -293,7 +294,8 @@ app.use((req, res, next) => {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    // The microphone is for voice notes, and only ever this page's own.
+    'Permissions-Policy': 'camera=(), microphone=(self), geolocation=()',
     'Cross-Origin-Opener-Policy': 'same-origin',
   });
   if (req.secure) res.set('Strict-Transport-Security', 'max-age=31536000');

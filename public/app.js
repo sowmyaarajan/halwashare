@@ -148,6 +148,7 @@ function fileIcon(type, name) {
 }
 
 const isImage = (type) => !!type && type.startsWith('image/');
+const isAudio = (type) => !!type && type.startsWith('audio/');
 
 function escapeHtml(str) {
   return String(str)
@@ -800,14 +801,29 @@ if (isRoomPage) {
       const mode = self ? '' : u.away ? 'away' : (peer ? peer.mode : 'connecting');
       const badge = self ? '' :
         '<span class="mode-pill mode-' + mode + '">' + modeLabel(mode) + '</span>';
-      return '<li class="user-item' + (u.away ? ' away' : '') + '">' +
+      const lock = !self && peer && peer.safety && peer.linkAlive()
+        ? '<span class="safety-badge" title="Verified link available — tap to compare the safety code">🔐</span>' : '';
+      return '<li class="user-item' + (u.away ? ' away' : '') + (self ? '' : ' tappable') + '"' +
+        (self ? '' : ' data-id="' + escapeHtml(u.id) + '" tabindex="0" role="button" title="Safety code with ' + escapeHtml(u.label) + '"') + '>' +
         '<span class="avatar">' + escapeHtml(u.label.replace(/\D/g, '') || '?') + '</span>' +
         '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you)' : u.away ? ' · reconnecting…' : '') + '</span>' +
-        badge +
+        lock + badge +
       '</li>';
     }).join('');
     $('user-count').textContent = users.length;
+    syncWakeLock();
+    if (users.some(u => u.id !== myId && !u.away)) maybeAskNotify();
   }
+
+  userListEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.user-item[data-id]');
+    if (item) showSafety(item.dataset.id);
+  });
+  userListEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const item = e.target.closest('.user-item[data-id]');
+    if (item) { e.preventDefault(); showSafety(item.dataset.id); }
+  });
 
   function modeLabel(mode) {
     if (mode === 'p2p') return 'direct';
@@ -875,6 +891,12 @@ if (isRoomPage) {
       // Downloads streaming over the direct link died with it. Ask for the
       // rest over the relay; the bytes already saved stay saved.
       if (prev === 'p2p' && mode === 'relay') setTimeout(() => restartDownloadsFrom(this.id), 0);
+      if (mode === 'p2p') {
+        const pc = this.pc;
+        safetyCode(this).then((code) => {
+          if (this.pc === pc) { this.safety = code; refreshUsers(); }
+        });
+      }
       clearTimeout(this.graceTimer);
       const waiters = this.openWaiters;
       this.openWaiters = [];
@@ -1475,11 +1497,11 @@ if (isRoomPage) {
     };
     const card = renderFileCard(meta, true);
 
-    // Show our own image immediately from the local file — no transfer needed.
-    if (isImage(file.type)) {
+    // Show our own picture or voice note straight from the local file.
+    if (isImage(file.type) || (isAudio(file.type) && file.size <= AUTO_PREVIEW_MAX)) {
       const url = URL.createObjectURL(file);
       objectUrls.push(url);
-      attachPreview(card, url, file.name);
+      attachPreview(card, url, file.name, file.type);
     }
     setCardState(fileId, 'ready', peers.size ? 'Ready to send' : 'Waiting for someone to join');
 
@@ -1589,6 +1611,8 @@ if (isRoomPage) {
     renderFileCard(meta, false);
     setCardState(meta.fileId, 'ready', formatSize(meta.size) + ' · from ' + meta.sender);
     playPing();
+    noteArrival(meta.sender + (isAudio(meta.fileType) && /^Voice note/.test(meta.name) ? ' sent a voice note' : ' shared a file'),
+      meta.name + ' · ' + formatSize(meta.size));
     updateEmptyState();
 
     // Small images arrive on their own so pictures just appear, like a chat.
@@ -1610,7 +1634,7 @@ if (isRoomPage) {
      budget — a flood of image offers must not fill this tab's memory. */
   let autoBytes = 0;
   function wantsAutoPreview(meta) {
-    if (!isImage(meta.fileType) || !(meta.size > 0) || meta.size > AUTO_PREVIEW_MAX) return false;
+    if (!(isImage(meta.fileType) || isAudio(meta.fileType)) || !(meta.size > 0) || meta.size > AUTO_PREVIEW_MAX) return false;
     if (autoBytes + meta.size > AUTO_PREVIEW_BUDGET) return false;
     autoBytes += meta.size;
     return true;
@@ -1652,7 +1676,7 @@ if (isRoomPage) {
 
       if (url) {
         objectUrls.push(url);
-        if (isImage(xfer.mime) && card) attachPreview(card, url, xfer.name);
+        if ((isImage(xfer.mime) || isAudio(xfer.mime)) && card) attachPreview(card, url, xfer.name, xfer.mime);
         if (xfer.auto) {
           setCardState(xfer.fileId, 'done', formatSize(xfer.size) + ' · received');
           if (card) setDownloadLink(card, url, xfer.name);
@@ -1984,8 +2008,18 @@ if (isRoomPage) {
     }
   }
 
-  function attachPreview(card, url, name) {
+  function attachPreview(card, url, name, mime) {
     if (card.el.querySelector('.file-preview')) return;
+    if (isAudio(mime)) {
+      const audio = document.createElement('audio');
+      audio.className = 'file-preview file-audio';
+      audio.controls = true;
+      audio.preload = 'metadata';
+      audio.src = url;
+      card.el.insertBefore(audio, card.el.querySelector('.file-track'));
+      scrollToBottom();
+      return;
+    }
     const img = document.createElement('img');
     img.className = 'file-preview';
     img.src = url;
@@ -2052,7 +2086,8 @@ if (isRoomPage) {
     if (msg.type === 'system') renderSystem(msg);
     else {
       renderChat(msg);
-      if (msg.sender !== myLabel) playPing();
+      const mine = msg.senderId ? msg.senderId === myId : msg.sender === myLabel;
+      if (!mine) { playPing(); noteArrival(msg.sender, msg.text); }
     }
     updateEmptyState();
   });
@@ -2113,30 +2148,62 @@ if (isRoomPage) {
     if (nearBottom) requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
   }
 
-  /* ── Keep the screen awake while bytes move ──────────────────
-     A phone that dims and locks mid-transfer suspends the page and the
-     transfer stalls, on both the sending and the receiving side. Hold a
-     screen wake lock while anything is in flight. The browser drops the
+  /* ── Keep the screen awake ───────────────────────────────────
+     A phone whose screen turns off suspends the page: the connection
+     drops and any transfer stalls. Nothing a web page can do keeps it
+     running with the screen off, so instead keep the screen on — always
+     while bytes are moving, and, unless the person turns it off with ☕,
+     the whole time someone else is in the room. The browser drops the
      lock whenever the page is hidden, so take it again on return. */
   let activeSends = 0;
   let wakeLock = null;
   let wakeLockPending = false;
+  let stayAwake = true;
+  try { stayAwake = localStorage.getItem('halwa-awake') !== '0'; } catch (_) {}
+
+  const btnAwake = $('btn-awake');
+  if ('wakeLock' in navigator) {
+    btnAwake.classList.remove('hidden');
+    paintAwake();
+  }
+  btnAwake.addEventListener('click', () => {
+    stayAwake = !stayAwake;
+    try { localStorage.setItem('halwa-awake', stayAwake ? '1' : '0'); } catch (_) {}
+    paintAwake();
+    syncWakeLock();
+    toast(stayAwake
+      ? 'Screen stays on while others are in the room'
+      : 'Screen can turn off now — it still stays on during transfers');
+  });
+
+  function paintAwake() {
+    btnAwake.classList.toggle('on', stayAwake);
+    btnAwake.setAttribute('aria-pressed', String(stayAwake));
+    btnAwake.title = stayAwake
+      ? 'Screen stays on while others are here — tap to let it turn off'
+      : 'Screen may turn off — tap to keep it on while others are here';
+  }
 
   function isTransferring() {
     return activeSends > 0 || incoming.size > 0 || pendingRequests.size > 0;
   }
 
+  function wantAwake() {
+    if (isTransferring()) return true;
+    return stayAwake && roomUsers.some(u => u.id !== myId && !u.away);
+  }
+
   async function syncWakeLock() {
     if (!('wakeLock' in navigator)) return;
-    const want = isTransferring() && document.visibilityState === 'visible';
+    const want = wantAwake() && document.visibilityState === 'visible';
     if (want && !wakeLock && !wakeLockPending) {
       wakeLockPending = true;
       try {
         const lock = await navigator.wakeLock.request('screen');
         wakeLock = lock;
         lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
-        // The transfer may have finished while we waited for the lock.
-        if (!isTransferring()) syncWakeLock();
+        // Things may have changed while we waited for the lock.
+        if (!wantAwake()) syncWakeLock();
       } catch (_) { /* low battery, or not allowed: the transfer still runs */ }
       wakeLockPending = false;
     } else if (!want && wakeLock) {
@@ -2147,9 +2214,268 @@ if (isRoomPage) {
   }
 
   document.addEventListener('visibilitychange', syncWakeLock);
+  // Some browsers only grant the lock after a tap.
+  document.addEventListener('pointerdown', () => { if (!wakeLock) syncWakeLock(); }, { passive: true });
   // incoming and pendingRequests change in many places; checking every
   // couple of seconds is cheaper than hooking each one and never misses.
   setInterval(syncWakeLock, 2000);
+
+  /* ── Alerts while in the background ──────────────────────────
+     A file or message that arrives while HalwaShare is not on screen
+     shows as a count in the tab title and on the app icon, and — if the
+     person allowed it — as a notification. */
+  const baseTitle = document.title;
+  let unread = 0;
+
+  function noteArrival(title, body) {
+    if (document.visibilityState === 'visible') return;
+    unread++;
+    document.title = '(' + unread + ') ' + baseTitle;
+    if (navigator.setAppBadge) navigator.setAppBadge(unread).catch(() => {});
+    if ('Notification' in window && Notification.permission === 'granted') {
+      showNotice(title, String(body || ''));
+    }
+  }
+
+  async function showNotice(title, body) {
+    const opts = {
+      body: body.length > 140 ? body.slice(0, 139) + '…' : body,
+      tag: 'halwa-' + urlCode,       // one notification per room, replaced
+      renotify: true,
+      icon: '/icons/icon-192.png',
+      data: { url: location.pathname },
+    };
+    try {
+      const reg = 'serviceWorker' in navigator && await navigator.serviceWorker.getRegistration();
+      if (reg) await reg.showNotification(title, opts);
+      else new Notification(title, opts);
+    } catch (_) {}
+  }
+
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible' || !unread) return;
+    unread = 0;
+    document.title = baseTitle;
+    if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
+    try {
+      const reg = 'serviceWorker' in navigator && await navigator.serviceWorker.getRegistration();
+      if (reg) (await reg.getNotifications({ tag: 'halwa-' + urlCode })).forEach(n => n.close());
+    } catch (_) {}
+  });
+
+  /* Asked once per device, and only once there is someone to hear from. */
+  let notifyAsked = false;
+  function maybeAskNotify() {
+    if (notifyAsked) return;
+    notifyAsked = true;
+    if (!('Notification' in window) || Notification.permission !== 'default') return;
+    try {
+      if (localStorage.getItem('halwa-notify-asked')) return;
+      localStorage.setItem('halwa-notify-asked', '1');
+    } catch (_) { return; }
+
+    const bar = document.createElement('div');
+    bar.className = 'share-confirm notify-ask';
+    bar.setAttribute('role', 'dialog');
+    bar.setAttribute('aria-label', 'Notifications');
+    const title = document.createElement('p');
+    title.className = 'share-confirm-title';
+    title.textContent = '🔔 Get a notification when a file or message arrives while HalwaShare is in the background?';
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const no = document.createElement('button');
+    no.type = 'button';
+    no.className = 'btn btn-ghost btn-sm';
+    no.textContent = 'Not now';
+    const yes = document.createElement('button');
+    yes.type = 'button';
+    yes.className = 'btn btn-primary btn-sm';
+    yes.textContent = 'Turn on';
+    actions.append(no, yes);
+    bar.append(title, actions);
+    document.querySelector('.composer').before(bar);
+
+    no.addEventListener('click', () => bar.remove());
+    yes.addEventListener('click', async () => {
+      bar.remove();
+      try {
+        const result = await Notification.requestPermission();
+        toast(result === 'granted' ? 'Notifications on' : 'Notifications stay off — you can allow them in your browser settings');
+      } catch (_) {}
+    });
+  }
+
+  /* ── Safety code ─────────────────────────────────────────────
+     The direct link is encrypted with keys whose fingerprints travel
+     through the server. A server that swapped them could sit in the
+     middle unseen — except that both people would then see different
+     pictures here. Same pictures on both screens: nobody is in between. */
+  const SAFETY_EMOJI = [
+    '🍎','🍌','🍇','🍓','🍒','🍍','🥕','🌽','🍄','🌵','🌻','🌲','🍁','🌙','⭐','🔥',
+    '🌈','❄️','⚡','💧','🐶','🐱','🐭','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐮','🐷',
+    '🐸','🐵','🐔','🐧','🐦','🦆','🦉','🐝','🦋','🐌','🐢','🐙','🐬','🐳','🦀','🐘',
+    '🚗','🚲','✈️','🚀','⛵','🏠','⏰','🎈','🎁','📚','✏️','🔑','🔔','🎸','⚽','🎲',
+  ];
+
+  async function safetyCode(peer) {
+    try {
+      const pc = peer.pc;
+      if (!pc || !crypto.subtle) return null;
+      const fp = (d) => {
+        const m = d && /a=fingerprint:(\S+) ([0-9A-Fa-f:]+)/.exec(d.sdp || '');
+        return m ? m[1].toLowerCase() + ' ' + m[2].toUpperCase() : null;
+      };
+      const a = fp(pc.localDescription);
+      const b = fp(pc.remoteDescription);
+      if (!a || !b) return null;
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode([a, b].sort().join('|')));
+      const h = new Uint8Array(digest);
+      return [h[0], h[1], h[2], h[3]].map(x => SAFETY_EMOJI[x & 63]).join(' ');
+    } catch (_) { return null; }
+  }
+
+  function showSafety(id) {
+    const user = roomUsers.find(u => u.id === id);
+    const peer = peers.get(id);
+    if (!user) return;
+    const name = user.label;
+    const sheet = document.createElement('div');
+    sheet.className = 'lightbox safety-sheet';
+    const card = document.createElement('div');
+    card.className = 'safety-card';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', 'Safety code with ' + name);
+
+    const h = document.createElement('h3');
+    h.textContent = 'Safety code with ' + name;
+    const code = document.createElement('div');
+    code.className = 'safety-code';
+    const p = document.createElement('p');
+    p.className = 'safety-text';
+
+    if (peer && peer.safety && peer.linkAlive()) {
+      code.textContent = peer.safety;
+      p.textContent = 'Check that ' + name + "'s screen shows the same four pictures, in the same order. " +
+        'If they match, your direct link goes straight to them and nobody can listen in.';
+    } else {
+      code.textContent = '—';
+      p.textContent = user.away
+        ? name + ' is reconnecting. The code appears once you are linked directly again.'
+        : 'No direct link to ' + name + ' right now, so there is no code to compare. ' +
+          'Files go through the HalwaShare server instead, which passes them on without keeping them.';
+    }
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'btn btn-primary btn-sm';
+    close.textContent = 'Done';
+    card.append(h, code, p, close);
+    sheet.appendChild(card);
+    document.body.appendChild(sheet);
+    close.focus();
+
+    const done = () => { sheet.remove(); document.removeEventListener('keydown', esc); };
+    const esc = (e) => { if (e.key === 'Escape') done(); };
+    document.addEventListener('keydown', esc);
+    close.addEventListener('click', done);
+    sheet.addEventListener('click', (e) => { if (e.target === sheet) done(); });
+  }
+
+  /* ── Voice notes ─────────────────────────────────────────────
+     Recorded here, then offered like any other file. They are small,
+     so they arrive on their own and play inline. */
+  const btnMic = $('btn-mic');
+  const recBar = $('rec-bar');
+  const recTime = $('rec-time');
+  const composerEl = document.querySelector('.composer');
+  const VOICE_MAX_MS = 5 * 60 * 1000;
+  let rec = null;
+
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder && window.isSecureContext) {
+    btnMic.classList.remove('hidden');
+  }
+  btnMic.addEventListener('click', () => (rec ? stopRecording(false) : startRecording()));
+  $('btn-rec-cancel').addEventListener('click', () => stopRecording(true));
+
+  async function startRecording() {
+    if (rec) return;
+    rec = { pending: true };
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      rec = null;
+      return toast(err && err.name === 'NotAllowedError'
+        ? 'Microphone blocked — allow it in your browser settings to record'
+        : 'Could not use the microphone', 'error');
+    }
+    // MP4 plays everywhere, iPhones included; fall back to WebM elsewhere.
+    const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+      .find(t => { try { return MediaRecorder.isTypeSupported(t); } catch (_) { return false; } });
+    let recorder;
+    try {
+      recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    } catch (_) {
+      stream.getTracks().forEach(t => t.stop());
+      rec = null;
+      return toast('This browser cannot record audio', 'error');
+    }
+    const r = rec = { recorder, stream, chunks: [], started: Date.now(), cancelled: false };
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) r.chunks.push(e.data); };
+    recorder.onstop = () => finishRecording(r);
+    recorder.start(1000);
+    r.timer = setInterval(() => {
+      const ms = Date.now() - r.started;
+      if (ms >= VOICE_MAX_MS) return stopRecording(false);
+      paintRecTime(ms);
+    }, 250);
+    paintRecTime(0);
+    composerEl.classList.add('recording');
+    recBar.classList.remove('hidden');
+    btnMic.textContent = '⏹';
+    btnMic.title = 'Stop and send';
+  }
+
+  function paintRecTime(ms) {
+    const sec = Math.floor(ms / 1000);
+    recTime.textContent = Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
+  }
+
+  function stopRecording(cancel) {
+    const r = rec;
+    if (!r || r.pending) return;
+    rec = null;
+    r.cancelled = cancel;
+    r.stoppedAt = Date.now();
+    clearInterval(r.timer);
+    composerEl.classList.remove('recording');
+    recBar.classList.add('hidden');
+    btnMic.textContent = '🎙️';
+    btnMic.title = 'Record a voice note';
+    try { r.recorder.stop(); } catch (_) { finishRecording(r); }
+    r.stream.getTracks().forEach(t => t.stop());
+  }
+
+  function finishRecording(r) {
+    if (r.done) return;
+    r.done = true;
+    if (r.cancelled) return;
+    if ((r.stoppedAt || Date.now()) - r.started < 700 || !r.chunks.length) {
+      return toast('Too short — tap 🎙️, speak, then tap ⏹ to send');
+    }
+    const mime = (r.recorder.mimeType || r.chunks[0].type || 'audio/webm').split(';')[0];
+    const ext = /mp4|aac|m4a/.test(mime) ? 'm4a' : /ogg/.test(mime) ? 'ogg' : 'webm';
+    const t = new Date(r.started);
+    const pad = (n) => String(n).padStart(2, '0');
+    const name = 'Voice note ' + pad(t.getHours()) + '.' + pad(t.getMinutes()) + '.' + pad(t.getSeconds()) + '.' + ext;
+    offerFile(new File([new Blob(r.chunks, { type: mime })], name, { type: mime }));
+  }
+
+  // A page that is hidden mid-recording is about to be suspended: send
+  // what was said rather than lose it.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && rec && !rec.pending) stopRecording(false);
+  });
 
   window.addEventListener('beforeunload', (e) => {
     const busy = isTransferring();

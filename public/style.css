@@ -960,3 +960,50 @@ body.dark .drop-inner { color: var(--accent-warm); }
 /* Someone whose connection dropped: still in the room, coming back. */
 .user-item.away { opacity: .6; }
 .mode-away  { color: var(--text-dim); background: var(--line); }
+
+/* ── Stay awake ───────────────────────────────────────────── */
+.awake-btn { opacity: .45; }
+.awake-btn.on { opacity: 1; background: var(--accent-soft); border-color: var(--accent-ring); }
+
+/* ── Safety code ──────────────────────────────────────────── */
+.user-item.tappable { cursor: pointer; border-radius: var(--r-sm); }
+.user-item.tappable:hover { background: var(--surface-2); }
+.user-item.tappable:focus-visible { outline: 3px solid var(--accent-ring); outline-offset: 2px; }
+.safety-badge { flex: none; font-size: 13px; line-height: 1; }
+.safety-sheet { padding: 16px; cursor: default; }
+.safety-card {
+  width: 100%;
+  max-width: 360px;
+  padding: 22px 20px 18px;
+  text-align: center;
+  color: var(--text);
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+}
+.safety-card h3 { margin: 0 0 14px; font-size: 16px; }
+.safety-code { font-size: 38px; letter-spacing: 8px; line-height: 1.2; margin-bottom: 14px; }
+.safety-text { margin: 0 0 16px; font-size: 14px; line-height: 1.5; color: var(--text-mid); }
+
+/* ── Voice notes ──────────────────────────────────────────── */
+.file-audio { height: 40px; max-height: none; object-fit: initial; background: none; }
+.rec-bar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.rec-bar.hidden { display: none; }
+.rec-hint { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; font-size: 13.5px; color: var(--text-mid); }
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); animation: rec-pulse 1.1s ease-in-out infinite; }
+@keyframes rec-pulse { 50% { opacity: .25; } }
+.composer.recording .msg-input,
+.composer.recording #btn-send,
+.composer.recording .attach:not(.mic-btn) { display: none; }
+.composer.recording .mic-btn { color: var(--bad); border-color: var(--bad); }
+@media (max-width: 680px) {
+  .rec-hint { display: none; }
+}

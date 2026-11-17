@@ -11,6 +11,15 @@ npm start
 Open the printed **Network** URL on any device on the same Wi-Fi, or scan the QR
 code in the room sidebar.
 
+## In a room
+
+- **Files of any size**: offered instantly, streamed when someone saves them, resumed if the connection drops.
+- **Chat**, with read receipts, a typing indicator and pasted screenshots.
+- **Voice notes**: tap 🎙️, speak, tap ⏹. They arrive on their own and play inline.
+- **Safety code**: tap a person to see four pictures. If their screen shows the same four, your direct link goes straight to them, with nobody in between.
+- **Screen stays on** while others are in the room, so a phone does not sleep and drop out (☕ turns this off).
+- **Background alerts**: a count in the tab title and on the app icon, plus a notification if you allow it, when something arrives while HalwaShare is not on screen.
+
 ## Install it as an app
 
 HalwaShare is an installable web app, so it can live on the home screen
@@ -162,10 +171,11 @@ exactly this reason. Scaling out means adding `@socket.io/redis-adapter` plus
 sticky sessions first.
 
 Also inherent to the design (ToffeeShare works the same way): the sender's tab
-must stay open for the whole transfer. HalwaShare holds a screen wake lock on
-both ends while a file is moving, so the screen does not dim and lock mid-send;
-switching to another app still pauses it on phones, and leaving the page
-mid-transfer asks first.
+must stay open for the whole transfer. A phone suspends a web page as soon as
+its screen turns off, so HalwaShare keeps the screen on instead: always while a
+file is moving, and — unless the ☕ button in the header is switched off — the
+whole time someone else is in the room. Switching to another app still pauses
+it on phones, and leaving the page mid-transfer asks first.
 
 ## Security
 

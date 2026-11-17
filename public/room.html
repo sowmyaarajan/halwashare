@@ -28,6 +28,7 @@
     <button id="header-code" class="code-pill" title="Copy room code">----</button>
 
     <div class="header-tools">
+      <button id="btn-awake" class="icon-btn awake-btn hidden" type="button" aria-pressed="false" title="Keep the screen on">☕</button>
       <button id="btn-sound" class="icon-btn" title="Toggle sound">🔔</button>
       <button class="icon-btn" data-theme-btn title="Toggle dark mode">🌙</button>
       <button id="btn-exit" class="btn btn-ghost btn-sm">Leave</button>
@@ -76,6 +77,12 @@
       <div class="composer">
         <label for="file-input" class="icon-btn attach" title="Attach files">📎</label>
         <input type="file" id="file-input" class="hidden" multiple>
+        <button id="btn-mic" class="icon-btn attach mic-btn hidden" type="button" title="Record a voice note">🎙️</button>
+        <div id="rec-bar" class="rec-bar hidden" role="status">
+          <span class="rec-dot"></span><span id="rec-time">0:00</span>
+          <span class="rec-hint">Recording — tap ⏹ to send</span>
+          <button id="btn-rec-cancel" class="btn btn-ghost btn-sm" type="button">Cancel</button>
+        </div>
         <input id="msg-input" class="msg-input" type="text" maxlength="4000"
                placeholder="Write a message, or paste a screenshot…" autocomplete="off">
         <button id="btn-send" class="btn btn-primary">Send</button>

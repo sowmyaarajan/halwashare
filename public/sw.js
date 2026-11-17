@@ -147,3 +147,17 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(new Response(entry.stream, { headers }));
 });
+
+/* ── Notifications ──────────────────────────────────────────
+   Tapping one brings the room back to the front, or reopens it. */
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const path = (event.notification.data && event.notification.data.url) || '/';
+  const target = /^\/join\/\d+$/.test(path) ? path : '/';
+  event.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const open = all.find(c => new URL(c.url).pathname === target);
+    if (open) return open.focus();
+    return self.clients.openWindow(target);
+  })());
+});
