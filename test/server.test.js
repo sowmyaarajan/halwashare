@@ -5,6 +5,7 @@
 
 process.env.TRUST_PROXY = '1';
 process.env.ROOM_GRACE_MS = '300';
+process.env.USER_GRACE_MS = '400';
 process.env.MAX_ROOMS = '40';
 process.env.GLOBAL_MISSES_PER_MIN = '120';
 
@@ -365,6 +366,104 @@ test('one IPv6 /64 shares a single guessing budget', async () => {
   // ...but the next /64 over is someone else.
   const c = await connected(client({ ip: '2001:db8:5:7::1' }));
   assert.deepEqual(await call(c, 'room:check', { code: '299998' }), { error: 'No room with that code. Check the digits and try again.' });
+});
+
+test('a dropped connection is "away", not gone, and coming back keeps everything', async () => {
+  const ip = '10.71.0.1';
+  const a = await connected(client({ ip }));
+  const { code } = await call(a, 'room:create', { clientId: 'phone-a-secret-001' });
+  const ja = await call(a, 'room:join', { code, clientId: 'phone-a-secret-001' });
+  const b = await connected(client({ ip }));
+  const jb = await call(b, 'room:join', { code, clientId: 'phone-b-secret-001' });
+  a.emit('file:offer', { fileId: 'doc1', name: 'report.pdf', size: 10, type: 'application/pdf' });
+  await next(b, 'file:offer');
+
+  // B's connection drops: A sees B away, but no "left" and no lost files.
+  const away = next(a, 'room:users');
+  const noLeft = silent(a, 'rtc:peer-left', 250);
+  b.close();
+  const users = await away;
+  assert.deepEqual(users.find(u => u.id === jb.selfId), { id: jb.selfId, label: jb.label, away: true });
+  await noLeft;
+
+  // B comes back on a new connection: same id, same name, told apart as a return.
+  const b2 = await connected(client({ ip }));
+  const back = next(a, 'rtc:peer-joined');
+  const jb2 = await call(b2, 'room:join', { code, clientId: 'phone-b-secret-001', files: [] });
+  assert.equal(jb2.selfId, jb.selfId);
+  assert.equal(jb2.label, jb.label);
+  assert.deepEqual(await back, { id: jb.selfId, label: jb.label, rejoin: true, fresh: false });
+  assert.equal(jb2.history.find(h => h.fileId === 'doc1').available, true);
+
+  // A drops and returns while still holding its file: the file stays offered.
+  a.close();
+  await sleep(50);
+  const a2 = await connected(client({ ip }));
+  const ja2 = await call(a2, 'room:join', { code, clientId: 'phone-a-secret-001', files: ['doc1'] });
+  assert.equal(ja2.selfId, ja.selfId);
+  assert.ok(!jb2.history.some(h => h.type === 'system' && /left/.test(h.text)));
+
+  // Messages reach the person on their new connection.
+  const got = next(b2, 'msg:ack');
+  a2.emit('msg:ack', { id: 'm1', to: jb.selfId });
+  assert.equal((await got).from, ja.selfId);
+});
+
+test('someone who stays away is eventually reported as left', async () => {
+  const { a, b, ja, jb } = await pair();
+  a.emit('file:offer', { fileId: 'pic9', name: 'a.png', size: 5, type: 'image/png' });
+  await next(b, 'file:offer');
+  const gone = next(b, 'file:unavailable', 2000);
+  const left = next(b, 'rtc:peer-left', 2000);
+  a.close();
+  assert.deepEqual(await left, { id: ja.selfId, label: ja.label });
+  assert.deepEqual(await gone, { fileId: 'pic9' });
+  void jb;
+});
+
+test('a reloaded page loses the files it offered; leaving on purpose is immediate', async () => {
+  const ip = '10.72.0.1';
+  const a = await connected(client({ ip }));
+  const { code } = await call(a, 'room:create');
+  await call(a, 'room:join', { code, clientId: 'reload-secret-0001' });
+  const b = await connected(client({ ip }));
+  await call(b, 'room:join', { code, clientId: 'watcher-secret-001' });
+  a.emit('file:offer', { fileId: 'vid1', name: 'v.mp4', size: 9, type: 'video/mp4' });
+  await next(b, 'file:offer');
+
+  // Reload: the new page holds no files, so its old offer goes grey.
+  const gone = next(b, 'file:unavailable');
+  const a2 = await connected(client({ ip }));
+  await call(a2, 'room:join', { code, clientId: 'reload-secret-0001', fresh: true, files: [] });
+  assert.deepEqual(await gone, { fileId: 'vid1' });
+
+  // The old socket was retired: it is out of the room and its close is not a leave.
+  await sleep(100);
+  const noLeft = silent(b, 'rtc:peer-left', 600);
+  await noLeft;
+
+  // The Leave button: no waiting period.
+  const left = next(b, 'rtc:peer-left', 300);
+  a2.emit('room:leave');
+  await left;
+});
+
+test('relayed data follows a receiver that reconnected', async () => {
+  const ip = '10.73.0.1';
+  const a = await connected(client({ ip }));
+  const { code } = await call(a, 'room:create');
+  const ja = await call(a, 'room:join', { code, clientId: 'relay-sender-0001' });
+  const b = await connected(client({ ip }));
+  const jb = await call(b, 'room:join', { code, clientId: 'relay-recver-0001' });
+  b.close();
+  await sleep(50);
+  const b2 = await connected(client({ ip }));
+  await call(b2, 'room:join', { code, clientId: 'relay-recver-0001', files: [] });
+  const got = next(b2, 'relay:chunk');
+  a.emit('relay:chunk', { to: jb.selfId, tag: 3, buf: Buffer.from('hello') });
+  const m = await got;
+  assert.equal(m.from, ja.selfId);
+  assert.equal(Buffer.from(m.buf).toString(), 'hello');
 });
 
 // Keep this last: it spends the site-wide budget.

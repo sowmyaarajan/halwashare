@@ -41,6 +41,10 @@ const BUFFER_LOW       = 1 * 1024 * 1024; // resume below this
 const RELAY_WINDOW     = 4 * 1024 * 1024; // unacknowledged bytes allowed on the relay
 const RELAY_ACK_EVERY  = 1 * 1024 * 1024;
 const P2P_GRACE        = 10000;           // ms before falling back to the relay
+const ICE_WOBBLE       = 6000;            // a 'disconnected' link this long is treated as lost
+const STALL_MS         = 12000;           // no bytes this long: ask for the rest again
+const REQ_TIMEOUT      = 15000;           // no answer to a request this long: ask again
+const MAX_RETRIES      = 6;               // consecutive attempts without progress
 const AUTO_PREVIEW_MAX = 5 * 1024 * 1024; // images this small arrive automatically
 const AUTO_PREVIEW_BUDGET = 60 * 1024 * 1024; // …until this much has arrived unasked
 const CODE_LENGTH      = 6;               // digits in a room code — matches server.js
@@ -506,7 +510,19 @@ if (isRoomPage) {
   const clientId = getClientId();
 
   let myLabel = null;
-  let mySocketId = null;
+  let myId = null;          // our id in the room; stable across reconnects
+
+  /* Room messages wait until we are actually back in the room. While the
+     socket is down, socket.io holds what we emit and sends it the moment it
+     reconnects — before we have rejoined — and the server, not yet knowing
+     our room, would drop it: a file picked mid-reconnect would never reach
+     anyone. So hold them here and send them once the join has landed. */
+  let inRoom = false;
+  const held = [];
+  function roomEmit(event, data) {
+    if (inRoom && socket.connected) socket.emit(event, data);
+    else held.push([event, data]);
+  }
   let joined = false;
 
   const peers    = new Map(); // socketId -> Peer
@@ -543,7 +559,12 @@ if (isRoomPage) {
   document.querySelectorAll('[data-theme-btn]').forEach(b =>
     b.addEventListener('click', toggleTheme));
   btnSound.addEventListener('click', toggleSound);
-  btnExit.addEventListener('click', () => { window.location.href = '/'; });
+  // Leaving on purpose tells the room at once; closing the tab or losing
+  // the connection leaves us "away" for a while in case we come back.
+  btnExit.addEventListener('click', () => {
+    socket.emit('room:leave');
+    setTimeout(() => { window.location.href = '/'; }, 150);
+  });
 
   /* ── Toasts ──────────────────────────────────────────────── */
   function toast(message, kind) {
@@ -558,14 +579,22 @@ if (isRoomPage) {
   }
 
   /* ── Join ────────────────────────────────────────────────── */
+  /* Joining and re-joining are the same call. After a dropped connection
+     the server knows us by clientId and keeps our id, name and files, so
+     the others see us come straight back instead of leave and rejoin. */
   function join() {
-    socket.emit('room:join', { code: urlCode, clientId }, (res) => {
+    const first = !joined;
+    socket.emit('room:join', {
+      code: urlCode, clientId,
+      fresh: first,                 // a newly loaded page holds no old links or files
+      files: [...myFiles.keys()],   // what we can still send
+    }, (res) => {
       if (res && res.error) return showFatal(res.error);
 
-      const first = !joined;
       joined = true;
       myLabel = res.label;
-      mySocketId = res.selfId;
+      myId = res.selfId;
+      inRoom = true;
 
       renderUsers(res.users);
       if (first) {
@@ -573,10 +602,12 @@ if (isRoomPage) {
         res.history.forEach(renderHistoryEntry);
         showCapabilityNote();
         offerSharedFiles();
+      } else {
+        catchUp(res.history);
       }
-      // Peers already here will send us their offers.
-      res.peers.forEach(p => ensurePeer(p.id, p.label));
+      reconcilePeers(res.peers, res.users, first);
       updateEmptyState();
+      held.splice(0).forEach(([event, data]) => socket.emit(event, data));
     });
   }
 
@@ -587,9 +618,72 @@ if (isRoomPage) {
   });
 
   socket.on('disconnect', () => {
+    inRoom = false;
     const banner = $('offline-banner');
     if (banner) banner.classList.remove('hidden');
   });
+
+  /* A phone that slept may hold a socket that died without telling it, and
+     would otherwise only notice ~50 s later. Check the moment it wakes. */
+  function checkConnection() {
+    if (!joined && socket.connected) return;
+    if (!socket.connected) { socket.connect(); return; }
+    socket.timeout(4000).emit('room:ping', (err) => {
+      if (err) { socket.disconnect(); socket.connect(); }
+    });
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkConnection();
+  });
+  window.addEventListener('online', checkConnection);
+  window.addEventListener('pageshow', (e) => { if (e.persisted) checkConnection(); });
+
+  /* Messages and files that arrived while we were disconnected. */
+  function catchUp(history) {
+    const since = lastSeenTs;
+    for (const h of history) {
+      if (h.type === 'file') {
+        const card = cards.get(h.fileId);
+        if (!card) { if (h.ownerId !== myId) renderHistoryEntry(h); }
+        else if (!card.mine) setAvailability(card, h.available);
+      } else if (h.type === 'chat') {
+        if (!seenChat.has(h.id)) renderChat(h);
+      } else if (h.ts > since) {
+        renderSystem(h);
+      }
+    }
+  }
+
+  function setAvailability(card, available) {
+    if (!available && card.state === 'ready') {
+      card.meta.available = false;
+      setCardState(card.meta.fileId, 'gone', 'No longer available — ask ' + (card && card.meta.sender || 'the sender') + ' to share it again');
+      if (card.action) card.action.disabled = true;
+    } else if (available && card.state === 'gone' && card.meta.available === false) {
+      card.meta.available = true;
+      setCardState(card.meta.fileId, 'ready', formatSize(card.meta.size) + ' · from ' + card.meta.sender);
+      if (card.action) card.action.disabled = false;
+    }
+  }
+
+  /* Bring our links in line with who is actually in the room now. */
+  function reconcilePeers(list, users, first) {
+    const here = new Set(users.map(u => u.id));
+    for (const id of [...peers.keys()]) {
+      if (!here.has(id)) dropPeer(id, 'the sender left');
+    }
+    for (const p of list) {
+      const peer = peers.get(p.id);
+      if (!peer) { ensurePeer(p.id, p.label); continue; }
+      peer.label = p.label;
+      if (first || peer.linkAlive()) continue;
+      // Our link to them died while we were away. Start over, and ask them
+      // to offer a new one — they may not have noticed theirs is dead.
+      resetPeer(p.id, p.label);
+      socket.emit('rtc:signal', { to: p.id, payload: { type: 'reset' } });
+    }
+    refreshUsers();
+  }
 
   // The page is gone after a fatal error, so stop reconnecting to it.
   function showFatal(message) {
@@ -701,14 +795,14 @@ if (isRoomPage) {
   function renderUsers(users) {
     roomUsers = users;
     userListEl.innerHTML = users.map(u => {
-      const self = u.label === myLabel;
+      const self = u.id === myId;
       const peer = peers.get(u.id);
-      const mode = self ? '' : (peer ? peer.mode : 'connecting');
+      const mode = self ? '' : u.away ? 'away' : (peer ? peer.mode : 'connecting');
       const badge = self ? '' :
         '<span class="mode-pill mode-' + mode + '">' + modeLabel(mode) + '</span>';
-      return '<li class="user-item">' +
+      return '<li class="user-item' + (u.away ? ' away' : '') + '">' +
         '<span class="avatar">' + escapeHtml(u.label.replace(/\D/g, '') || '?') + '</span>' +
-        '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you)' : '') + '</span>' +
+        '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you)' : u.away ? ' · reconnecting…' : '') + '</span>' +
         badge +
       '</li>';
     }).join('');
@@ -719,16 +813,18 @@ if (isRoomPage) {
     if (mode === 'p2p') return 'direct';
     if (mode === 'relay') return 'relay';
     if (mode === 'dead') return 'offline';
+    if (mode === 'away') return 'away';
     return '…';
   }
 
-  /* Repaint the roster from local peer state — no round trip needed
-     when only a connection mode changed. */
+  /* Repaint the roster — no round trip needed when only a mode changed. */
   function refreshUsers() {
-    if (!myLabel) return;
-    const users = [{ id: mySocketId, label: myLabel }]
-      .concat([...peers.values()].map(p => ({ id: p.id, label: p.label })));
-    renderUsers(users);
+    if (myLabel) renderUsers(roomUsers);
+  }
+
+  function isAway(id) {
+    const u = roomUsers.find(x => x.id === id);
+    return !u || !!u.away;
   }
 
   /* ── Peer: one per participant, DataChannel or relay ─────── */
@@ -744,7 +840,17 @@ if (isRoomPage) {
       this.relayInflight = 0;
       this.relayWaiters = [];
       this.graceTimer = null;
+      this.iceTimer = null;
       this.openWaiters = [];
+      this.rxUnacked = 0;            // relay bytes received, not yet acknowledged
+      this.closed = false;
+      this.createdAt = Date.now();
+    }
+
+    /* A direct link that is up right now. */
+    linkAlive() {
+      return this.mode === 'p2p' && !!this.dc && this.dc.readyState === 'open' &&
+        !!this.pc && this.pc.connectionState === 'connected';
     }
 
     get chunkSize() {
@@ -763,8 +869,12 @@ if (isRoomPage) {
     }
 
     settle(mode) {
-      if (this.mode === mode) return;
+      if (this.mode === mode || this.closed) return;
+      const prev = this.mode;
       this.mode = mode;
+      // Downloads streaming over the direct link died with it. Ask for the
+      // rest over the relay; the bytes already saved stay saved.
+      if (prev === 'p2p' && mode === 'relay') setTimeout(() => restartDownloadsFrom(this.id), 0);
       clearTimeout(this.graceTimer);
       const waiters = this.openWaiters;
       this.openWaiters = [];
@@ -776,8 +886,13 @@ if (isRoomPage) {
       refreshUsers();
     }
 
-    sendCtrl(msg) {
-      if (this.mode === 'p2p' && this.dc && this.dc.readyState === 'open') {
+    /* `via` pins a message to one route. A file's start, chunks and end must
+       all travel the same way, or a chunk could overtake another and the
+       file would be scrambled. Without it, use whatever works now. */
+    sendCtrl(msg, via) {
+      const direct = this.dc && this.dc.readyState === 'open';
+      if (via === 'p2p' && !direct) throw linkLost(this);
+      if (via !== 'relay' && direct && (via === 'p2p' || this.mode === 'p2p')) {
         this.dc.send(JSON.stringify(msg));
       } else {
         socket.emit('relay:ctrl', { to: this.id, msg });
@@ -785,20 +900,22 @@ if (isRoomPage) {
     }
 
     /* One framed chunk, honouring backpressure so memory stays flat. */
-    async sendChunk(tag, view) {
-      if (this.mode === 'relay') {
-        while (this.relayInflight >= RELAY_WINDOW) {
+    async sendChunk(tag, view, via) {
+      if (via === 'relay') {
+        while (this.relayInflight >= RELAY_WINDOW && !this.closed) {
           await new Promise(r => this.relayWaiters.push(r));
         }
+        if (this.closed) throw linkLost(this);
         this.relayInflight += view.byteLength;
         socket.emit('relay:chunk', { to: this.id, tag, buf: view });
         return;
       }
 
       const dc = this.dc;
-      if (!dc || dc.readyState !== 'open') throw new Error('Link to ' + this.label + ' closed');
+      if (!dc || dc.readyState !== 'open') throw linkLost(this);
 
       if (dc.bufferedAmount > BUFFER_HIGH) await this.waitDrain();
+      if (dc.readyState !== 'open' || this.dc !== dc) throw linkLost(this);
 
       // 4-byte tag header lets several files share one channel safely.
       const frame = new Uint8Array(4 + view.byteLength);
@@ -846,6 +963,24 @@ if (isRoomPage) {
       }
     }
 
+    /* An abandoned stream's bytes may never be acknowledged; start clean. */
+    resetRelayCredit() {
+      this.relayInflight = 0;
+      const waiters = this.relayWaiters;
+      this.relayWaiters = [];
+      waiters.forEach(w => w());
+    }
+
+    /* Acknowledge relay bytes as they land, whether or not they still
+       belong to a live download, so the sender's window never jams. */
+    ackRelay(bytes, flush) {
+      this.rxUnacked += bytes;
+      if (this.rxUnacked > 0 && (flush || this.rxUnacked >= RELAY_ACK_EVERY)) {
+        this.sendCtrl({ t: 'ack', bytes: this.rxUnacked });
+        this.rxUnacked = 0;
+      }
+    }
+
     creditRelay(bytes) {
       this.relayInflight = Math.max(0, this.relayInflight - bytes);
       if (this.relayInflight < RELAY_WINDOW) {
@@ -863,12 +998,26 @@ if (isRoomPage) {
     }
 
     close() {
+      this.closed = true;
       clearTimeout(this.graceTimer);
+      clearTimeout(this.iceTimer);
+      // Silence the old link first so its closing does not look like news.
+      if (this.dc) { this.dc.onopen = this.dc.onclose = this.dc.onerror = this.dc.onmessage = null; }
+      if (this.pc) { this.pc.onconnectionstatechange = this.pc.onicecandidate = this.pc.ondatachannel = null; }
       try { if (this.dc) this.dc.close(); } catch (_) {}
       try { if (this.pc) this.pc.close(); } catch (_) {}
       this.relayWaiters.forEach(w => w());
       this.relayWaiters = [];
+      const waiters = this.openWaiters;
+      this.openWaiters = [];
+      waiters.forEach(w => w.reject(new Error('Link replaced')));
     }
+  }
+
+  function linkLost(peer) {
+    const err = new Error('Link to ' + peer.label + ' closed');
+    err.linkLost = true;
+    return err;
   }
 
   function ensurePeer(id, label) {
@@ -890,9 +1039,31 @@ if (isRoomPage) {
     return peer;
   }
 
+  /* Throw away a peer's link and start a new one. Anything we were
+     downloading from them asks for the rest once the new link is up. */
+  function resetPeer(id, label) {
+    const old = peers.get(id);
+    if (old) { old.close(); peers.delete(id); }
+    const peer = ensurePeer(id, label || (old && old.label));
+    restartDownloadsFrom(id);
+    return peer;
+  }
+
+  /* Gone for good: stop everything to do with them. */
+  function dropPeer(id, reason) {
+    const peer = peers.get(id);
+    if (!peer) return;
+    peer.settle('dead');
+    failTransfersFrom(id, reason);
+    stopRowsFor(id);
+    peer.close();
+    peers.delete(id);
+    refreshUsers();
+  }
+
   async function startOffer(peer) {
     await rtcConfigReady;
-    if (peer.pc) return;
+    if (peer.pc || peer.closed) return;
     const pc = buildPC(peer);
     const dc = pc.createDataChannel('halwa', { ordered: true });
     wireChannel(peer, dc);
@@ -919,10 +1090,20 @@ if (isRoomPage) {
     };
     pc.ondatachannel = (e) => wireChannel(peer, e.channel);
     pc.onconnectionstatechange = () => {
+      if (peer.pc !== pc || peer.mode === 'dead') return;
       const s = pc.connectionState;
-      if (s === 'failed' || s === 'closed' || s === 'disconnected') {
+      clearTimeout(peer.iceTimer);
+      if (s === 'failed' || s === 'closed') {
         // Keep the peer usable — the relay can carry everything.
-        if (peer.mode !== 'dead') peer.settle('relay');
+        peer.settle('relay');
+      } else if (s === 'disconnected') {
+        // Phones hop networks; a link often recovers within seconds. Only
+        // give up on it if it stays down.
+        peer.iceTimer = setTimeout(() => {
+          if (peer.pc === pc && pc.connectionState === 'disconnected') peer.settle('relay');
+        }, ICE_WOBBLE);
+      } else if (s === 'connected' && peer.mode === 'relay' && peer.dc && peer.dc.readyState === 'open') {
+        peer.settle('p2p'); // back on the direct link
       }
     };
     return pc;
@@ -933,9 +1114,10 @@ if (isRoomPage) {
     dc.bufferedAmountLowThreshold = BUFFER_LOW;
     peer.dc = dc;
 
-    dc.onopen = () => peer.settle('p2p');
-    dc.onclose = () => { if (peer.mode === 'p2p') peer.settle('relay'); };
-    dc.onerror = () => { if (peer.mode === 'p2p') peer.settle('relay'); };
+    const lost = () => { if (peer.dc === dc && peer.mode === 'p2p') peer.settle('relay'); };
+    dc.onopen = () => { if (peer.dc === dc) peer.settle('p2p'); };
+    dc.onclose = lost;
+    dc.onerror = lost;
     dc.onmessage = (e) => {
       if (typeof e.data === 'string') {
         let msg = null;
@@ -945,34 +1127,41 @@ if (isRoomPage) {
         if (e.data.byteLength < 4) return;
         const tag = new DataView(e.data).getUint32(0);
         const payload = new Uint8Array(e.data, 4);
-        handleChunk(peer, tag, payload, payload.byteLength);
+        handleChunk(peer, tag, payload, payload.byteLength, false);
       }
     };
   }
 
   /* ── Signalling ──────────────────────────────────────────── */
-  socket.on('rtc:peer-joined', ({ id, label }) => {
-    const peer = ensurePeer(id, label);
+  socket.on('rtc:peer-joined', ({ id, label, rejoin, fresh }) => {
+    const existing = peers.get(id);
+    // Back from a blip with the direct link still up: nothing to rebuild.
+    if (rejoin && !fresh && existing && existing.linkAlive()) {
+      existing.label = label;
+      refreshUsers();
+      return;
+    }
+    const peer = existing ? resetPeer(id, label) : ensurePeer(id, label);
     startOffer(peer); // the established side always offers
     refreshUsers();
   });
 
-  socket.on('rtc:peer-left', ({ id }) => {
-    const peer = peers.get(id);
-    if (!peer) return;
-    peer.settle('dead');
-    failTransfersFrom(id, 'the sender went offline');
-    peer.close();
-    peers.delete(id);
-    refreshUsers();
-  });
+  socket.on('rtc:peer-left', ({ id }) => dropPeer(id, 'the sender left the room'));
 
   socket.on('rtc:signal', async ({ from, payload }) => {
-    const peer = ensurePeer(from);
+    let peer = ensurePeer(from);
     try {
-      if (payload.type === 'offer') {
+      if (payload.type === 'reset') {
+        // They came back and their link to us is dead. Offer a new one —
+        // unless we just started one for them.
+        if (Date.now() - peer.createdAt < 4000 && !peer.linkAlive()) return;
+        startOffer(resetPeer(from));
+
+      } else if (payload.type === 'offer') {
         await rtcConfigReady;
-        if (!peer.pc) buildPC(peer);
+        // Only one side ever offers, so an offer always means a new link.
+        if (peer.pc) peer = resetPeer(from);
+        buildPC(peer);
         await peer.pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
         const answer = await peer.pc.createAnswer();
         await peer.pc.setLocalDescription(answer);
@@ -1018,7 +1207,7 @@ if (isRoomPage) {
   socket.on('relay:chunk', ({ from, tag, buf }) => {
     const peer = ensurePeer(from);
     const view = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf);
-    handleChunk(peer, tag, view, view.byteLength);
+    handleChunk(peer, tag, view, view.byteLength, true);
   });
 
   /* ── Control protocol ────────────────────────────────────── */
@@ -1026,47 +1215,70 @@ if (isRoomPage) {
     if (!msg || !msg.t) return;
 
     switch (msg.t) {
-      case 'req':                    // someone wants a file we offered
+      case 'req': {                  // someone wants a file we offered
+        // A repeat request for the same file replaces the old stream: they
+        // lost it and want the rest from `offset`.
+        const key = peer.id + ':' + msg.fileId;
+        const prev = serving.get(key);
+        if (prev) { prev.cancelled = true; peer.resetRelayCredit(); }
+        const job = { cancelled: false };
+        serving.set(key, job);
         peer.enqueue(() => {
+          if (job.cancelled || peer.closed) return;
           activeSends++;
           syncWakeLock();
-          return serveFile(peer, msg.fileId).catch(err => {
-            peer.sendCtrl({ t: 'err', fileId: msg.fileId, reason: String(err.message || err) });
-          }).finally(() => { activeSends--; syncWakeLock(); });
+          return serveFile(peer, msg.fileId, msg.offset, msg.rid, job).catch(err => {
+            if (job.cancelled || err.linkLost) return; // they will ask again
+            try {
+              peer.sendCtrl({ t: 'err', fileId: msg.fileId, rid: msg.rid, reason: String(err.message || err) });
+            } catch (_) {}
+          }).finally(() => {
+            activeSends--;
+            if (serving.get(key) === job) serving.delete(key);
+            syncWakeLock();
+          });
         });
         break;
+      }
 
       case 'start': {                // the owner is about to stream
         const xfer = pendingRequests.get(msg.fileId);
         if (!xfer || xfer.ownerId !== peer.id) return; // only the owner may answer
+        if (msg.rid !== undefined && msg.rid !== xfer.rid) return; // answer to an older request
         if (!Number.isInteger(msg.tag)) return;
         pendingRequests.delete(msg.fileId);
+        // Resuming needs the sender to pick up exactly where we stopped. An
+        // older app always starts from zero, and we cannot unwrite bytes.
+        if ((msg.offset || 0) !== xfer.received) {
+          return abortIncoming(xfer, 'Transfer interrupted — tap Try again.');
+        }
         xfer.tag = msg.tag;
         // xfer.size stays the size from the offer: the sender is held to what
         // they advertised, so they cannot keep streaming until memory runs out.
-        xfer.received = 0;
-        xfer.startedAt = performance.now();
-        xfer.lastTick = xfer.startedAt;
-        xfer.lastBytes = 0;
+        xfer.lastData = Date.now();
+        xfer.lastTick = performance.now();
+        xfer.lastBytes = xfer.received;
         xfer.peerId = peer.id;
-        incoming.set(peer.id + ':' + msg.tag, xfer);
-        setCardState(msg.fileId, 'active', 'Receiving…');
+        xfer.key = peer.id + ':' + msg.tag;
+        incoming.set(xfer.key, xfer);
+        setCardState(msg.fileId, 'active', xfer.received ? 'Resuming…' : 'Receiving…');
         break;
       }
 
       case 'end': {
+        if (peer.rxUnacked) peer.ackRelay(0, true); // hand back the last partial window
         const xfer = incoming.get(peer.id + ':' + msg.tag);
         if (!xfer) return;
         incoming.delete(peer.id + ':' + msg.tag);
-        // Return the last partial megabyte of relay credit, or the sender
-        // waits forever for its buffer to drain and its queue stalls.
-        if (peer.mode === 'relay' && xfer.sinceAck) {
-          peer.sendCtrl({ t: 'ack', bytes: xfer.sinceAck });
-          xfer.sinceAck = 0;
-        }
+        xfer.key = null;
         if (xfer.received !== xfer.size) {
-          abortIncoming(xfer, 'Transfer incomplete — only ' + formatSize(xfer.received) +
-            ' of ' + formatSize(xfer.size) + ' arrived. Try again.');
+          // Some bytes went missing on the way: fetch the rest.
+          if (++xfer.retries > MAX_RETRIES) {
+            abortIncoming(xfer, 'Transfer incomplete — only ' + formatSize(xfer.received) +
+              ' of ' + formatSize(xfer.size) + ' arrived. Try again.');
+          } else {
+            sendRequest(xfer);
+          }
           break;
         }
         finishIncoming(xfer);
@@ -1103,6 +1315,7 @@ if (isRoomPage) {
         const xfer = pendingRequests.get(msg.fileId) ||
           [...incoming.values()].find(x => x.fileId === msg.fileId);
         if (!xfer || xfer.ownerId !== peer.id) return;
+        if (msg.rid !== undefined && msg.rid !== xfer.rid) return; // about an older request
         for (const [key, x] of incoming) if (x === xfer) incoming.delete(key);
         abortIncoming(xfer, String(msg.reason || 'Transfer failed').slice(0, 200));
         break;
@@ -1110,32 +1323,102 @@ if (isRoomPage) {
     }
   }
 
-  function handleChunk(peer, tag, view, byteLength) {
+  function handleChunk(peer, tag, view, byteLength, viaRelay) {
+    if (viaRelay) peer.ackRelay(byteLength);
     const key = peer.id + ':' + tag;
     const xfer = incoming.get(key);
-    if (!xfer) return;
+    if (!xfer) return; // from a stream we gave up on
 
     xfer.received += byteLength;
+    xfer.lastData = Date.now();
+    xfer.retries = 0;
     if (xfer.received > xfer.size) {
       incoming.delete(key);
       return abortIncoming(xfer, 'Transfer stopped — the sender sent more than the file size');
     }
     xfer.pending = (xfer.pending || Promise.resolve()).then(() => xfer.sink.write(view))
       .catch(err => abortIncoming(xfer, describeSaveError(err)));
-
-    if (peer.mode === 'relay') {
-      xfer.sinceAck = (xfer.sinceAck || 0) + byteLength;
-      if (xfer.sinceAck >= RELAY_ACK_EVERY) {
-        peer.sendCtrl({ t: 'ack', bytes: xfer.sinceAck });
-        xfer.sinceAck = 0;
-      }
-    }
     tickProgress(xfer);
   }
 
+  /* ── Resume ──────────────────────────────────────────────────
+     A download is never thrown away because a link hiccuped. Whenever it
+     stalls, or the route it used goes down, we ask the sender for the rest
+     from the byte we stopped at, into the same file. */
+  let ridSeq = 0;
+
+  function downloads() {
+    return new Set([...incoming.values(), ...pendingRequests.values()]);
+  }
+
+  function sendRequest(xfer) {
+    if (xfer.aborted) return;
+    if (xfer.key) { incoming.delete(xfer.key); xfer.key = null; } // late chunks of the old stream are ignored
+    const rid = xfer.rid = ++ridSeq;
+    xfer.reqAt = Date.now();
+    pendingRequests.set(xfer.fileId, xfer);
+    const peer = ensurePeer(xfer.ownerId);
+    peer.ready().then(() => {
+      if (xfer.rid !== rid || pendingRequests.get(xfer.fileId) !== xfer) return;
+      try {
+        peer.sendCtrl({ t: 'req', fileId: xfer.fileId, offset: xfer.received, rid });
+      } catch (_) { /* link dropped this instant; the watchdog asks again */ }
+    }, () => { /* link replaced or peer gone: handled elsewhere */ });
+  }
+
+  function restartDownloadsFrom(id) {
+    for (const xfer of downloads()) {
+      if (xfer.ownerId === id) {
+        setCardState(xfer.fileId, 'active', 'Reconnecting…');
+        sendRequest(xfer);
+      }
+    }
+  }
+
+  setInterval(() => {
+    const now = Date.now();
+    // Hand back relay credit for bytes that arrived but filled no window.
+    peers.forEach(p => { if (p.rxUnacked) p.ackRelay(0, true); });
+
+    for (const xfer of downloads()) {
+      // Bytes still flowing — over the direct link they can, even while a
+      // socket is down — means leave it alone.
+      const idle = xfer.key ? now - xfer.lastData : now - xfer.reqAt;
+      const blocked = !socket.connected || isAway(xfer.ownerId);
+      if (xfer.waiting) {
+        if (blocked) continue;
+        xfer.waiting = false;   // everyone is back: pick up where we stopped
+        xfer.retries = 0;
+        setCardState(xfer.fileId, 'active', 'Reconnecting…');
+        sendRequest(xfer);
+        continue;
+      }
+      if (idle < (xfer.key ? STALL_MS : REQ_TIMEOUT)) continue;
+      if (blocked) {
+        // A phone is asleep or switching networks. Wait, without counting
+        // it as a failure; the download resumes when both are back.
+        xfer.waiting = true;
+        const card = cards.get(xfer.fileId);
+        if (card) {
+          card.status.textContent = socket.connected
+            ? 'Paused — waiting for ' + (card.meta.sender || 'the sender') + ' to reconnect…'
+            : 'Paused — reconnecting…';
+        }
+        continue;
+      }
+      if (++xfer.retries > MAX_RETRIES) {
+        for (const [key, x] of incoming) if (x === xfer) incoming.delete(key);
+        abortIncoming(xfer, 'Lost the connection to the sender. Tap Try again.');
+        continue;
+      }
+      setCardState(xfer.fileId, 'active', 'Reconnecting…');
+      sendRequest(xfer);
+    }
+  }, 2000);
+
   function failTransfersFrom(peerId, reason) {
     for (const [key, xfer] of [...incoming]) {
-      if (xfer.peerId === peerId) {
+      if (xfer.ownerId === peerId) {
         incoming.delete(key);
         abortIncoming(xfer, 'Transfer stopped — ' + reason);
       }
@@ -1188,7 +1471,7 @@ if (isRoomPage) {
 
     const meta = {
       fileId, name: file.name, size: file.size, fileType: file.type,
-      sender: myLabel, ownerId: mySocketId, ts: Date.now(), available: true,
+      sender: myLabel, ownerId: myId, ts: Date.now(), available: true,
     };
     const card = renderFileCard(meta, true);
 
@@ -1200,26 +1483,32 @@ if (isRoomPage) {
     }
     setCardState(fileId, 'ready', peers.size ? 'Ready to send' : 'Waiting for someone to join');
 
-    socket.emit('file:offer', {
+    roomEmit('file:offer', {
       fileId, name: file.name, size: file.size, type: file.type,
     });
     updateEmptyState();
   }
 
-  async function serveFile(peer, fileId) {
+  const serving = new Map(); // peerId + ':' + fileId -> { cancelled }
+
+  async function serveFile(peer, fileId, fromOffset, rid, job) {
     const file = myFiles.get(fileId);
     if (!file) throw new Error('That file is no longer shared');
 
     const tag = (++tagSeq) & 0xffffffff;
-    const chunkSize = peer.chunkSize;
+    // The whole file goes one way, chosen now; see Peer.sendCtrl.
+    const via = peer.mode === 'p2p' && peer.dc && peer.dc.readyState === 'open' ? 'p2p' : 'relay';
+    const chunkSize = via === 'relay' ? RELAY_CHUNK : peer.chunkSize;
+    const begin = Number.isSafeInteger(fromOffset) && fromOffset > 0 && fromOffset <= file.size ? fromOffset : 0;
+    const stopped = () => job.cancelled || peer.closed;
 
     peer.sendCtrl({
-      t: 'start', fileId, tag,
+      t: 'start', fileId, tag, rid, offset: begin,
       name: file.name, size: file.size, mime: file.type,
-    });
+    }, via);
 
     const progress = {
-      fileId, size: file.size, sent: 0,
+      fileId, size: file.size, sent: begin,
       startedAt: performance.now(), lastTick: performance.now(), lastBytes: 0,
       direction: 'up', peerId: peer.id, peerLabel: peer.label,
     };
@@ -1234,31 +1523,39 @@ if (isRoomPage) {
     }
 
     // Read the next slice while the current one is in flight.
-    let offset = 0;
-    let nextRead = readSlice(file, 0, chunkSize);
+    let offset = begin;
+    let nextRead = offset < file.size ? readSlice(file, offset, chunkSize) : null;
 
     while (offset < file.size) {
       const buf = await nextRead;
+      if (stopped()) return;
       const advance = buf.byteLength;
       if (offset + advance < file.size) {
         nextRead = readSlice(file, offset + advance, chunkSize);
       }
-      await peer.sendChunk(tag, new Uint8Array(buf));
+      await peer.sendChunk(tag, new Uint8Array(buf), via);
+      if (stopped()) return;
       offset += advance;
-      progress.sent = Math.max(0, offset - peer.inflight); // only what has left
+      progress.sent = Math.max(begin, offset - peer.inflight); // only what has left
       tickProgress(progress);
     }
 
-    peer.sendCtrl({ t: 'end', fileId, tag });
+    peer.sendCtrl({ t: 'end', fileId, tag }, via);
 
     // The loop finishes as soon as the last chunk is queued, which can be well
-    // before it reaches the other side. Keep reporting until the buffer empties.
-    while (peer.inflight > 0) {
-      progress.sent = Math.max(0, file.size - peer.inflight);
+    // before it reaches the other side. Keep reporting until the buffer empties,
+    // but do not wait forever on a receiver that has gone quiet.
+    let lastInflight = peer.inflight;
+    let quietSince = performance.now();
+    while (peer.inflight > 0 && !stopped()) {
+      progress.sent = Math.max(begin, file.size - peer.inflight);
       tickProgress(progress, true);
       await Promise.race([peer.drained(), new Promise(r => setTimeout(r, 300))]);
-      if (peer.mode !== 'relay' && (!peer.dc || peer.dc.readyState !== 'open')) break;
+      if (via === 'p2p' && (!peer.dc || peer.dc.readyState !== 'open')) break;
+      if (peer.inflight !== lastInflight) { lastInflight = peer.inflight; quietSince = performance.now(); }
+      else if (performance.now() - quietSince > 30000) break;
     }
+    if (stopped()) return;
 
     const card = cards.get(fileId);
     if (card) {
@@ -1288,7 +1585,7 @@ if (isRoomPage) {
   const pendingRequests = new Map(); // fileId -> xfer awaiting 'start'
 
   socket.on('file:offer', (meta) => {
-    if (meta.ownerId === mySocketId) return; // our own card already exists
+    if (meta.ownerId === myId) return; // our own card already exists
     renderFileCard(meta, false);
     setCardState(meta.fileId, 'ready', formatSize(meta.size) + ' · from ' + meta.sender);
     playPing();
@@ -1304,7 +1601,7 @@ if (isRoomPage) {
     if (!card || card.mine) return;
     card.meta.available = false;
     if (card.state === 'ready') {
-      setCardState(fileId, 'gone', 'No longer available — sender left');
+      setCardState(fileId, 'gone', 'No longer available — ask ' + (card && card.meta.sender || 'the sender') + ' to share it again');
       if (card.action) card.action.disabled = true;
     }
   });
@@ -1339,21 +1636,12 @@ if (isRoomPage) {
     const xfer = {
       fileId: meta.fileId, name: meta.name, size: meta.size,
       mime: meta.fileType, sink, ownerId: meta.ownerId,
-      auto: !!options.auto, direction: 'down', received: 0,
+      auto: !!options.auto, direction: 'down', received: 0, retries: 0,
       startedAt: performance.now(), lastTick: performance.now(), lastBytes: 0,
     };
-    pendingRequests.set(meta.fileId, xfer);
-    syncWakeLock();
     setCardState(meta.fileId, 'active', 'Connecting…');
-
-    const peer = ensurePeer(meta.ownerId);
-    try {
-      await peer.ready();
-    } catch (err) {
-      pendingRequests.delete(meta.fileId);
-      return abortIncoming(xfer, err.message || 'Peer unavailable');
-    }
-    peer.sendCtrl({ t: 'req', fileId: meta.fileId });
+    sendRequest(xfer);
+    syncWakeLock();
   }
 
   async function finishIncoming(xfer) {
@@ -1395,8 +1683,11 @@ if (isRoomPage) {
   }
 
   function abortIncoming(xfer, reason) {
+    if (xfer.aborted) return;
+    xfer.aborted = true;
     try { if (xfer.sink) xfer.sink.abort(); } catch (_) {}
-    pendingRequests.delete(xfer.fileId);
+    if (xfer.key) { incoming.delete(xfer.key); xfer.key = null; }
+    if (pendingRequests.get(xfer.fileId) === xfer) pendingRequests.delete(xfer.fileId);
     setCardState(xfer.fileId, 'error', reason);
     const card = cards.get(xfer.fileId);
     if (card && card.action) {
@@ -1447,6 +1738,21 @@ if (isRoomPage) {
       'Receiving ' + pct.toFixed(0) + '% · ' + formatSize(done) + ' of ' + formatSize(total) +
       (speed > 0 ? ' · ' + formatSpeed(speed) : '') +
       (isFinite(eta) ? ' · ' + formatEta(eta) : '');
+  }
+
+  /* A receiver left for good: their rows stop showing a live transfer. */
+  function stopRowsFor(peerId) {
+    for (const card of cards.values()) {
+      if (!card.mine || !card.peerRows || !card.peerRows.has(peerId)) continue;
+      const row = card.peerRows.get(peerId);
+      if (row.state === 'active') {
+        row.state = 'stopped';
+        row.pct.textContent = 'stopped';
+      }
+      const busy = [...card.peerRows.values()].some(r => r.state === 'active');
+      if (!busy && card.state === 'active') setCardState(card.meta.fileId, 'ready', 'Ready to send');
+      updateSenderSummary(card);
+    }
   }
 
   /* One row per recipient on your own card, created on first sight. */
@@ -1518,14 +1824,21 @@ if (isRoomPage) {
     if (entry.type === 'system') return renderSystem(entry);
     if (entry.type === 'chat') return renderChat(entry);
     if (entry.type === 'file') {
-      if (entry.ownerId === mySocketId) return;
+      if (entry.ownerId === myId) {
+        // Ours, from before this page was reloaded: the browser no longer
+        // has the file, so it cannot be sent until it is picked again.
+        const card = renderFileCard(entry, true);
+        setCardState(entry.fileId, 'gone', 'Pick this file again to share it — the page was reloaded');
+        card.actions.innerHTML = '';
+        return;
+      }
       renderFileCard(entry, false);
       if (entry.available) {
         setCardState(entry.fileId, 'ready', formatSize(entry.size) + ' · from ' + entry.sender);
         // Pictures shared before we arrived should still just appear.
         if (wantsAutoPreview(entry)) requestFile(entry, { preferMemory: true, auto: true });
       } else {
-        setCardState(entry.fileId, 'gone', 'No longer available — sender left');
+        setCardState(entry.fileId, 'gone', 'No longer available — ask ' + (entry.sender || 'the sender') + ' to share it again');
         const card = cards.get(entry.fileId);
         if (card && card.action) card.action.disabled = true;
       }
@@ -1543,7 +1856,11 @@ if (isRoomPage) {
     return row;
   }
 
+  let lastSeenTs = 0;            // newest message on screen, for catching up
+  const seenChat = new Set();    // chat ids on screen
+
   function renderSystem(msg) {
+    lastSeenTs = Math.max(lastSeenTs, msg.ts || 0);
     const el = document.createElement('div');
     el.className = 'msg-system';
     el.textContent = msg.text;
@@ -1552,7 +1869,12 @@ if (isRoomPage) {
   }
 
   function renderChat(msg) {
-    const mine = msg.sender === myLabel;
+    if (msg.id) {
+      if (seenChat.has(msg.id)) return;
+      seenChat.add(msg.id);
+    }
+    lastSeenTs = Math.max(lastSeenTs, msg.ts || 0);
+    const mine = msg.senderId ? msg.senderId === myId : msg.sender === myLabel;
     const row = rowFor(msg.sender, msg.ts, mine);
 
     const bubble = document.createElement('div');
@@ -1593,6 +1915,7 @@ if (isRoomPage) {
 
   function renderFileCard(meta, mine) {
     if (cards.has(meta.fileId)) return cards.get(meta.fileId);
+    lastSeenTs = Math.max(lastSeenTs, meta.ts || 0);
 
     const row = rowFor(meta.sender, meta.ts, mine);
     const card = document.createElement('div');
@@ -1630,7 +1953,7 @@ if (isRoomPage) {
       stop.textContent = 'Stop sharing';
       stop.addEventListener('click', () => {
         myFiles.delete(meta.fileId);
-        socket.emit('file:revoke', { fileId: meta.fileId });
+        roomEmit('file:revoke', { fileId: meta.fileId });
         setCardState(meta.fileId, 'gone', 'You stopped sharing this');
         stop.remove();
       });
@@ -1713,14 +2036,14 @@ if (isRoomPage) {
   let typingSent = 0;
   msgInput.addEventListener('input', () => {
     const now = Date.now();
-    if (now - typingSent > 1200) { typingSent = now; socket.emit('chat:typing', true); }
+    if (inRoom && now - typingSent > 1200) { typingSent = now; socket.emit('chat:typing', true); }
   });
 
   function sendMessage() {
     const text = msgInput.value;
     if (!text.trim()) return;
-    socket.emit('chat:message', { text });
-    socket.emit('chat:typing', false);
+    roomEmit('chat:message', { text });
+    if (inRoom) socket.emit('chat:typing', false);
     msgInput.value = '';
     msgInput.focus();
   }

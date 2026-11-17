@@ -956,3 +956,7 @@ body.dark .drop-inner { color: var(--accent-warm); }
   .features { grid-template-columns: 1fr; }
   .toasts { right: 12px; left: 12px; bottom: 12px; max-width: none; }
 }
+
+/* Someone whose connection dropped: still in the room, coming back. */
+.user-item.away { opacity: .6; }
+.mode-away  { color: var(--text-dim); background: var(--line); }

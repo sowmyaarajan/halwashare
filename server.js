@@ -32,6 +32,10 @@ const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 // An empty room lingers this long so a refresh, a locked phone or a dropped
 // connection does not destroy it; a room nobody ever enters goes the same way.
 const ROOM_GRACE_MS = Number(process.env.ROOM_GRACE_MS || 120000);
+// A person whose connection drops — screen locked, app in the background,
+// Wi-Fi handing over to mobile data — is kept as "away" this long, with the
+// same name and files, before the room is told they left.
+const USER_GRACE_MS = Number(process.env.USER_GRACE_MS || 180000);
 
 const MAX_CONN_PER_IP = Number(process.env.MAX_CONN_PER_IP || 30);
 const MAX_SIGNAL_BYTES = 64 * 1024;
@@ -49,7 +53,12 @@ const RELAY_BYTES_PER_SEC = Number(process.env.RELAY_BYTES_PER_SEC || 16 * 1024 
    else would let a client pick its own IP and dodge the limits. */
 const TRUST_PROXY = !!(process.env.TRUST_PROXY || process.env.RENDER || process.env.FLY_APP_NAME);
 
-/* rooms: code -> { code, users: [{ id, clientId, label }], history: [], expiry } */
+/* rooms: code -> { code, users: [member], history: [], expiry }
+   member: { pid, clientId, label, sid, awayTimer }
+     pid      public id other people address this person by; stable while
+              they are in the room, across reconnects
+     clientId secret id their browser tab holds; proves it is them
+     sid      current socket id, or null while they are away */
 const rooms = Object.create(null);
 
 function getLocalIP() {
@@ -92,7 +101,17 @@ function pushHistory(room, entry) {
 }
 
 function userList(room) {
-  return room.users.map(u => ({ id: u.id, label: u.label }));
+  return room.users.map(u => ({ id: u.pid, label: u.label, away: !u.sid }));
+}
+
+function newPid() {
+  return crypto.randomBytes(9).toString('base64url');
+}
+
+/* The socket currently behind a person, or null if they are away. */
+function sidOf(room, pid) {
+  const m = room && typeof pid === 'string' && room.users.find(u => u.pid === pid);
+  return (m && m.sid) || null;
 }
 
 /* Client ids that have joined this room, so they can return without the
@@ -123,11 +142,11 @@ function targetBacklog(id) {
   return n;
 }
 
-/* A socket may only address peers inside its own room. */
-function inSameRoom(socket, targetId) {
+/* A socket may only address people inside its own room. Returns the
+   target's socket id, or null when they are not here or are away. */
+function inSameRoom(socket, targetPid) {
   const code = socket.data.code;
-  const room = code && rooms[code];
-  return typeof targetId === 'string' && !!room && room.users.some(u => u.id === targetId);
+  return sidOf(code && rooms[code], targetPid);
 }
 
 function byteSize(value) {
@@ -439,7 +458,7 @@ io.on('connection', (socket) => {
 
   on('room:join', (arg, cb) => {
     const reply = typeof cb === 'function' ? cb : () => {};
-    const { code, clientId } = arg || {};
+    const { code, clientId, fresh } = arg || {};
     if (socket.data.code) return reply({ error: 'Already in a room.' });
     if (clientId !== undefined && (typeof clientId !== 'string' || !ID_RE.test(clientId))) {
       return reply({ error: 'Bad request.' });
@@ -449,60 +468,101 @@ io.on('connection', (socket) => {
     if (error) return reply({ error });
     if (!room) return reply({ error: 'No room with that code. It may have closed when everyone left.' });
 
-    // Reconnect / refresh with the same clientId keeps the same label and slot.
-    const returning = clientId && room.users.find(u => u.clientId === clientId);
-    let label;
+    // Coming back — a reconnect, a refresh, a phone waking up — keeps the
+    // same person: same id, same name, same files.
+    let member = clientId && room.users.find(u => u.clientId === clientId);
+    const returning = !!member;
 
-    if (returning) {
-      returning.id = socket.id;
-      label = returning.label;
+    if (member) {
+      // A refresh can arrive before the old socket has gone. Retire it
+      // quietly so its eventual disconnect does not count as leaving.
+      if (member.sid && member.sid !== socket.id) {
+        const old = io.sockets.sockets.get(member.sid);
+        if (old) {
+          old.data.code = null;
+          old.leave(code);
+          old.disconnect(true);
+        }
+      }
+      clearTimeout(member.awayTimer);
+      member.awayTimer = null;
+      member.sid = socket.id;
     } else {
       if (room.users.length >= MAX_USERS) {
         return reply({ error: 'This room is full (' + MAX_USERS + '/' + MAX_USERS + '). Ask someone to leave first.' });
       }
-      label = assignLabel(room);
-      room.users.push({ id: socket.id, clientId: clientId || socket.id, label });
+      member = { pid: newPid(), clientId: clientId || newPid(), label: assignLabel(room), sid: socket.id, awayTimer: null };
+      room.users.push(member);
     }
     clearTimeout(room.expiry);
     if (clientId) rememberMember(room, clientId);
 
     socket.join(code);
     socket.data.code = code;
-    socket.data.label = label;
-    socket.data.clientId = clientId || socket.id;
+    socket.data.label = member.label;
+    socket.data.pid = member.pid;
 
-    const peers = room.users.filter(u => u.id !== socket.id).map(u => ({ id: u.id, label: u.label }));
-    const live = new Set(room.users.map(u => u.id));
+    // Files this person offered survive only if their page still holds them.
+    // A refreshed page has lost its file handles; a reconnect has not.
+    if (returning) {
+      const holding = new Set(Array.isArray(arg.files)
+        ? arg.files.filter(f => typeof f === 'string').slice(0, 1000) : []);
+      for (const h of room.history) {
+        if (h.type === 'file' && h.ownerId === member.pid && !h.gone && !holding.has(h.fileId)) {
+          h.gone = true;
+          socket.to(code).emit('file:unavailable', { fileId: h.fileId });
+        }
+      }
+    }
 
+    const present = new Set(room.users.map(u => u.pid));
     reply({
-      selfId: socket.id,
-      label,
-      peers,
+      selfId: member.pid,
+      label: member.label,
+      peers: room.users.filter(u => u !== member && u.sid).map(u => ({ id: u.pid, label: u.label })),
       users: userList(room),
       maxUsers: MAX_USERS,
-      // A file is only still gettable if the person who offered it is present.
-      history: room.history.map(({ bytes, ...h }) =>
-        h.type === 'file' ? Object.assign(h, { available: live.has(h.ownerId) }) : h
+      // A file can still be fetched while the person who offered it is in the
+      // room — even if they are briefly away — and still holds it.
+      history: room.history.map(({ bytes, gone, ...h }) =>
+        h.type === 'file' ? Object.assign(h, { available: !gone && present.has(h.ownerId) }) : h
       ),
     });
 
     if (!returning) {
-      const sys = { type: 'system', text: label + ' joined', ts: Date.now() };
+      const sys = { type: 'system', text: member.label + ' joined', ts: Date.now() };
       pushHistory(room, sys);
       socket.to(code).emit('chat:message', sys);
     }
 
-    // Existing peers open the WebRTC offer towards the newcomer.
-    socket.to(code).emit('rtc:peer-joined', { id: socket.id, label });
+    // Others open a WebRTC link towards them. On a return, `fresh` says the
+    // page was reloaded, so any old link is certainly dead.
+    socket.to(code).emit('rtc:peer-joined', {
+      id: member.pid, label: member.label, rejoin: returning, fresh: fresh === true,
+    });
     io.to(code).emit('room:users', userList(room));
   });
+
+  /* Leaving on purpose: no grace period. */
+  on('room:leave', () => {
+    const { code, pid } = socket.data;
+    const room = code && rooms[code];
+    const member = room && room.users.find(u => u.pid === pid && u.sid === socket.id);
+    if (member) removeMember(room, member);
+    socket.data.code = null;
+    if (code) socket.leave(code);
+  });
+
+  /* Lets a page that just woke up check its connection is really alive. */
+  on('room:ping', (cb) => { if (typeof cb === 'function' && allow('misc')) cb(true); });
 
   /* ── WebRTC signalling — an opaque pipe ─────────────────── */
   on('rtc:signal', (arg) => {
     const { to, payload } = arg || {};
-    if (!inSameRoom(socket, to) || !payload || typeof payload !== 'object') return;
+    const sid = inSameRoom(socket, to);
+    if (!sid || !payload || typeof payload !== 'object') return;
     if (!allow('signal') || byteSize(payload) > MAX_SIGNAL_BYTES) return;
-    io.to(to).emit('rtc:signal', { from: socket.id, payload });
+    io.to(sid).emit('rtc:signal', { from: socket.data.pid, payload });
   });
 
   /* ── Fallback relay: used only when the P2P link fails ─── */
@@ -520,18 +580,24 @@ io.on('connection', (socket) => {
     const bucket = socketBucket(socket, 'relay');
     while (relayQueue.length) {
       const item = relayQueue[0];
+      // Resolved now, not when queued: the receiver may have reconnected on
+      // a new socket meanwhile. Away or gone, the item is dropped, and the
+      // receiver asks for the rest when it is back.
+      const code = socket.data.code;
+      const sid = sidOf(code && rooms[code], item.to);
       // A receiver that is not reading — slow, or deliberately stalled — must
       // not make the server buffer for it. Wait until it drains.
-      if (item.buf && (targetBacklog(item.to) > MAX_TARGET_BACKLOG || !bucket.take(item.buf.length))) {
+      if (sid && item.buf && (targetBacklog(sid) > MAX_TARGET_BACKLOG || !bucket.take(item.buf.length))) {
         relayTimer = setTimeout(pumpRelay, 25);
         return;
       }
       relayQueue.shift();
       relayQueued -= item.cost;
+      if (!sid) continue;
       if (item.buf) {
-        io.to(item.to).emit('relay:chunk', { from: socket.id, tag: item.tag, buf: item.buf });
+        io.to(sid).emit('relay:chunk', { from: socket.data.pid, tag: item.tag, buf: item.buf });
       } else {
-        io.to(item.to).emit('relay:ctrl', { from: socket.id, msg: item.msg });
+        io.to(sid).emit('relay:ctrl', { from: socket.data.pid, msg: item.msg });
       }
     }
   }
@@ -579,7 +645,7 @@ io.on('connection', (socket) => {
       type: 'chat',
       id: Math.random().toString(36).slice(2) + Date.now().toString(36),
       sender: label,
-      senderId: socket.id,
+      senderId: socket.data.pid,
       text: clean,
       ts: Date.now(),
     };
@@ -590,9 +656,10 @@ io.on('connection', (socket) => {
   /* Delivery receipt: recipients confirm, the sender counts them. */
   on('msg:ack', (arg) => {
     const { id, to } = arg || {};
-    if (typeof id !== 'string' || id.length > 64 || !inSameRoom(socket, to)) return;
+    const sid = inSameRoom(socket, to);
+    if (typeof id !== 'string' || id.length > 64 || !sid) return;
     if (!allow('misc')) return;
-    io.to(to).emit('msg:ack', { id, from: socket.id, label: socket.data.label });
+    io.to(sid).emit('msg:ack', { id, from: socket.data.pid, label: socket.data.label });
   });
 
   on('chat:typing', (isTyping) => {
@@ -620,7 +687,7 @@ io.on('connection', (socket) => {
       type: 'file',
       fileId,
       sender: label,
-      ownerId: socket.id,
+      ownerId: socket.data.pid,
       name: (name || 'file').slice(0, 300),
       size,
       fileType: type.slice(0, 200),
@@ -636,38 +703,52 @@ io.on('connection', (socket) => {
     const { code } = socket.data;
     if (!code || !rooms[code] || typeof fileId !== 'string') return;
     const room = rooms[code];
-    const owned = room.history.some(h => h.type === 'file' && h.fileId === fileId && h.ownerId === socket.id);
+    const owned = room.history.some(h => h.type === 'file' && h.fileId === fileId && h.ownerId === socket.data.pid);
     if (!owned) return;
     room.history = room.history.filter(h => !(h.type === 'file' && h.fileId === fileId));
     room.historyBytes = room.history.reduce((n, h) => n + (h.bytes || 0), 0);
     io.to(code).emit('file:unavailable', { fileId });
   });
 
+  /* A dropped connection is not leaving. Mark them away, keep their name
+     and files, and only tell the room they left if they stay gone. */
   on('disconnect', () => {
-    const { code, label } = socket.data;
+    const { code } = socket.data;
     const room = code && rooms[code];
     if (!room) return;
-
-    const wasHere = room.users.some(u => u.id === socket.id);
-    room.users = room.users.filter(u => u.id !== socket.id);
-    if (!wasHere) return;
-
-    // Their offers die with them — tell everyone so the cards grey out.
-    for (const h of room.history) {
-      if (h.type === 'file' && h.ownerId === socket.id) {
-        io.to(code).emit('file:unavailable', { fileId: h.fileId });
-      }
-    }
-
-    io.to(code).emit('rtc:peer-left', { id: socket.id, label });
+    const member = room.users.find(u => u.sid === socket.id);
+    if (!member) return;
+    member.sid = null;
     io.to(code).emit('room:users', userList(room));
-
-    const sys = { type: 'system', text: label + ' left', ts: Date.now() };
-    pushHistory(room, sys);
-    io.to(code).emit('chat:message', sys);
-    if (room.users.length === 0) scheduleExpiry(room);
+    clearTimeout(member.awayTimer);
+    member.awayTimer = setTimeout(() => removeMember(room, member), USER_GRACE_MS);
+    if (member.awayTimer.unref) member.awayTimer.unref();
   });
 });
+
+function removeMember(room, member) {
+  clearTimeout(member.awayTimer);
+  if (!room.users.includes(member)) return;
+  room.users = room.users.filter(u => u !== member);
+  room.members.delete(member.clientId);
+  const code = room.code;
+
+  // Their offers go with them — tell everyone so the cards grey out.
+  for (const h of room.history) {
+    if (h.type === 'file' && h.ownerId === member.pid && !h.gone) {
+      h.gone = true;
+      io.to(code).emit('file:unavailable', { fileId: h.fileId });
+    }
+  }
+
+  io.to(code).emit('rtc:peer-left', { id: member.pid, label: member.label });
+  io.to(code).emit('room:users', userList(room));
+
+  const sys = { type: 'system', text: member.label + ' left', ts: Date.now() };
+  pushHistory(room, sys);
+  io.to(code).emit('chat:message', sys);
+  if (room.users.length === 0) scheduleExpiry(room);
+}
 
 function start(port) {
   return new Promise((resolve) => {

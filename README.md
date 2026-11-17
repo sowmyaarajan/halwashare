@@ -57,6 +57,28 @@ A peer that has not negotiated WebRTC within 10 seconds switches to the relay
 automatically, so a transfer never silently dies. The relay forwards frames
 without buffering the file, under a 4 MB credit window.
 
+### Dropped connections and resume
+
+Phones lose their connection all the time — the screen locks, the app goes to
+the background, Wi-Fi hands over to mobile data. HalwaShare treats that as a
+pause, not a departure:
+
+- **Away, not gone.** A dropped person stays in the room as *reconnecting…*
+  for `USER_GRACE_MS` (3 minutes), with the same name and the same files. When
+  they come back nobody sees them leave and rejoin. *Leave* removes them at once.
+- **Downloads resume.** A transfer sticks to the route it started on, so bytes
+  can never arrive out of order. If it stalls or its route goes down, the
+  receiver asks for the rest from the byte it stopped at, into the same file.
+  While either phone is away it waits instead of failing.
+- **Nothing sent mid-reconnect is lost.** Files picked and messages typed while
+  offline are held until the room is rejoined, then sent. Messages that arrived
+  meanwhile are filled in.
+- **Waking up is fast.** When the page becomes visible again it checks its
+  connection at once rather than waiting ~50 s to notice it died.
+
+A refreshed page has lost its file handles, so files it offered go grey and
+must be picked again.
+
 ## Size limits
 
 To stream huge files to disk the browser needs a **secure context**:
@@ -188,6 +210,7 @@ Environment: `PORT` (default 4000), `MAX_USERS` (default 5), `PUBLIC_URL`,
 `MAX_ROOMS_PER_IP` (default 10),
 `MAX_CONN_PER_IP` (default 30), `ROOM_GRACE_MS` (default 120000),
 `RELAY_BYTES_PER_SEC` (default 16 MB/s), `GLOBAL_MISSES_PER_MIN` (default 300),
+`USER_GRACE_MS` (default 180000),
 `TRUST_PROXY`, `CLIENT_IP_HEADER`.
 
 ## Protocol
@@ -197,8 +220,8 @@ transfer tag so several files can share one link without mixing up.
 
 | Message | Direction | Meaning |
 |---|---|---|
-| `req` | receiver → owner | send me this file |
-| `start` | owner → receiver | here it comes, tagged `tag` |
+| `req` | receiver → owner | send me this file, from byte `offset` (request id `rid`) |
+| `start` | owner → receiver | here it comes from `offset`, tagged `tag`, answering `rid` |
 | `end` | owner → receiver | that was the last chunk |
 | `ack` | receiver → owner | relay flow control |
 | `err` | owner → receiver | could not serve it |
