@@ -16,7 +16,7 @@ code in the room sidebar.
 - **Files of any size**: offered instantly, streamed when someone saves them, resumed if the connection drops.
 - **Chat**, with read receipts, a typing indicator and pasted screenshots.
 - **Voice notes**: tap 🎙️, speak, tap ⏹. They arrive on their own and play inline.
-- **Safety code**: tap a person to see four pictures. If their screen shows the same four, your direct link goes straight to them, with nobody in between.
+- **Safety code**: tap a person to see twelve pictures. If their screen shows the same twelve, your direct link goes straight to them, with nobody in between.
 - **Screen stays on** while others are in the room, so a phone does not sleep and drop out (☕ turns this off).
 - **Background alerts**: a count in the tab title and on the app icon, plus a notification if you allow it, when something arrives while HalwaShare is not on screen.
 

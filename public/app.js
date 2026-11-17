@@ -2321,16 +2321,30 @@ if (isRoomPage) {
     try {
       const pc = peer.pc;
       if (!pc || !crypto.subtle) return null;
-      const fp = (d) => {
-        const m = d && /a=fingerprint:(\S+) ([0-9A-Fa-f:]+)/.exec(d.sdp || '');
-        return m ? m[1].toLowerCase() + ' ' + m[2].toUpperCase() : null;
-      };
-      const a = fp(pc.localDescription);
-      const b = fp(pc.remoteDescription);
-      if (!a || !b) return null;
-      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode([a, b].sort().join('|')));
+      // The certificates DTLS actually used, as the browser reports them —
+      // never the SDP text, which the server relays and could pad with a
+      // second fingerprint that the browser would accept but we would not show.
+      const stats = await pc.getStats();
+      let a = null, b = null;
+      stats.forEach((r) => {
+        if (a || r.type !== 'transport' || r.dtlsState !== 'connected') return;
+        const l = r.localCertificateId && stats.get(r.localCertificateId);
+        const m = r.remoteCertificateId && stats.get(r.remoteCertificateId);
+        if (!l || !m || !l.fingerprint || !m.fingerprint) return;
+        a = String(l.fingerprintAlgorithm).toLowerCase() + ' ' + String(l.fingerprint).toUpperCase();
+        b = String(m.fingerprintAlgorithm).toLowerCase() + ' ' + String(m.fingerprint).toUpperCase();
+      });
+      if (!a || !b) return null;   // e.g. Firefox, which does not report them
+      const digest = await crypto.subtle.digest('SHA-256',
+        new TextEncoder().encode('halwashare-safety-v1|' + [a, b].sort().join('|')));
+      // 12 pictures × 6 bits = 72 bits. A server in the middle picks keys for
+      // both sides, so it only needs a collision — about 2^36 key generations,
+      // far more than it can do while a connection is being set up.
       const h = new Uint8Array(digest);
-      return [h[0], h[1], h[2], h[3]].map(x => SAFETY_EMOJI[x & 63]).join(' ');
+      const bits = [...h.slice(0, 9)].map(x => x.toString(2).padStart(8, '0')).join('');
+      const pics = [];
+      for (let i = 0; i < 12; i++) pics.push(SAFETY_EMOJI[parseInt(bits.slice(i * 6, i * 6 + 6), 2)]);
+      return [pics.slice(0, 4), pics.slice(4, 8), pics.slice(8)].map(r => r.join(' ')).join('\n');
     } catch (_) { return null; }
   }
 
@@ -2355,12 +2369,14 @@ if (isRoomPage) {
 
     if (peer && peer.safety && peer.linkAlive()) {
       code.textContent = peer.safety;
-      p.textContent = 'Check that ' + name + "'s screen shows the same four pictures, in the same order. " +
+      p.textContent = 'Check that ' + name + "'s screen shows the same twelve pictures, in the same order. " +
         'If they match, your direct link goes straight to them and nobody can listen in.';
     } else {
       code.textContent = '—';
       p.textContent = user.away
         ? name + ' is reconnecting. The code appears once you are linked directly again.'
+        : peer && peer.linkAlive()
+        ? 'You are linked directly to ' + name + ', but this browser cannot show a safety code for it. Try Chrome, Edge or Safari.'
         : 'No direct link to ' + name + ' right now, so there is no code to compare. ' +
           'Files go through the HalwaShare server instead, which passes them on without keeping them.';
     }

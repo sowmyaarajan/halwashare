@@ -982,7 +982,7 @@ body.dark .drop-inner { color: var(--accent-warm); }
   box-shadow: var(--shadow-lg);
 }
 .safety-card h3 { margin: 0 0 14px; font-size: 16px; }
-.safety-code { font-size: 38px; letter-spacing: 8px; line-height: 1.2; margin-bottom: 14px; }
+.safety-code { font-size: 30px; letter-spacing: 6px; line-height: 1.35; margin-bottom: 14px; white-space: pre-line; }
 .safety-text { margin: 0 0 16px; font-size: 14px; line-height: 1.5; color: var(--text-mid); }
 
 /* ── Voice notes ──────────────────────────────────────────── */
