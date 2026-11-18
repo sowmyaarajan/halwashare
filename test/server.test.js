@@ -467,6 +467,101 @@ test('relayed data follows a receiver that reconnected', async () => {
 });
 
 // Keep this last: it spends the site-wide budget.
+const TOK = (c) => c.repeat(43);
+const hello = (s, name, device, tokens, clientId) =>
+  s.emit('presence:hello', { name, kind: 'laptop', device, tokens: tokens || [], clientId });
+
+test('devices on the same network see each other; others do not', async () => {
+  const ip = '10.7.1.1';
+  const a = await connected(client({ ip }));
+  const b = await connected(client({ ip }));
+  const far = await connected(client({ ip: '10.7.1.2' }));
+  const seenA = next(a, 'presence:nearby');
+  hello(a, 'Laptop', 'devAaaaaaaaaaaaaaaa');
+  await seenA;
+  const both = next(a, 'presence:nearby');
+  hello(b, '  Phone\u0000‮ ', 'devBbbbbbbbbbbbbbbb');
+  const list = await both;
+  assert.deepEqual(list.map(d => d.name), ['Phone']);   // cleaned, and not ourselves
+  assert.ok(list[0].id && !('device' in list[0]));     // no device id leaks
+  const farList = next(far, 'presence:nearby');
+  hello(far, 'Elsewhere', 'devCcccccccccccccccc');
+  assert.deepEqual(await farList, []);
+
+  // Invite b into a new room; b is told the code, the inviter gets it too.
+  const invited = next(b, 'presence:invited');
+  const res = await call(a, 'presence:invite', { to: list[0].id, clientId: 'inviterA1' });
+  const inv = await invited;
+  assert.match(res.code, /^\d{6}$/);
+  assert.equal(inv.code, res.code);
+  assert.equal(inv.from, 'Laptop');
+  assert.equal(inv.token, null);
+  // Nobody on another network can be invited by id.
+  const r2 = await call(far, 'presence:invite', { to: list[0].id });
+  assert.ok(r2.error);
+});
+
+test('paired devices find each other by token, and only the token holder can invite', async () => {
+  const a = await connected(client({ ip: '10.7.2.1' }));
+  const b = await connected(client({ ip: '10.7.3.1' }));   // different networks
+  const x = await connected(client({ ip: '10.7.4.1' }));
+  hello(a, 'Laptop', 'devDddddddddddddddd', [TOK('a')]);
+  await sleep(50);
+  const online = next(a, 'presence:paired');
+  hello(b, 'Phone', 'devEeeeeeeeeeeeeeee', [TOK('a')], 'phoneTab1');
+  assert.deepEqual(await online, { token: TOK('a'), online: true });
+
+  // Someone without the token cannot use it.
+  hello(x, 'Stranger', 'devFfffffffffffffff');
+  await sleep(50);
+  const bad = await call(x, 'presence:invite', { token: TOK('a') });
+  assert.ok(bad.error);
+
+  const invited = next(b, 'presence:invited');
+  const res = await call(a, 'presence:invite', { token: TOK('a'), clientId: 'laptopTab1' });
+  const inv = await invited;
+  assert.equal(inv.token, TOK('a'));
+  assert.equal(inv.code, res.code);
+  // The invited tab can join and gets its device name as its label.
+  const j = await call(b, 'room:join', { code: res.code, clientId: 'phoneTab1', name: 'Phone' });
+  assert.equal(j.label, 'Phone');
+
+  // Forgetting tells the other side, and it then shows offline.
+  const forgotten = next(b, 'presence:forgotten');
+  a.emit('presence:forget', { token: TOK('a') });
+  assert.deepEqual(await forgotten, { token: TOK('a') });
+});
+
+test('an invite into an existing room only works from inside that room', async () => {
+  const { a, code } = await pair();
+  const c = await connected(client());
+  hello(a, 'Laptop', 'devGgggggggggggggggg', [TOK('g')]);
+  hello(c, 'Tablet', 'devHhhhhhhhhhhhhhhh', [TOK('g')]);
+  await sleep(80);
+  const outsider = await connected(client());
+  hello(outsider, 'Out', 'devIiiiiiiiiiiiiiii', [TOK('g')]);
+  await sleep(50);
+  // Not in that room: refused.
+  assert.ok((await call(outsider, 'presence:invite', { token: TOK('g'), code })).error);
+  const invited = next(c, 'presence:invited');
+  const res = await call(a, 'presence:invite', { token: TOK('g'), code });
+  assert.equal(res.code, code);
+  assert.equal((await invited).code, code);
+});
+
+test('device names become room labels, kept unique', async () => {
+  const a = await connected(client());
+  const b = await connected(client());
+  const { code } = await call(a, 'room:create');
+  const ja = await call(a, 'room:join', { code, clientId: 'nameA' + ipSeq, name: 'iPhone' });
+  const jb = await call(b, 'room:join', { code, clientId: 'nameB' + ipSeq, name: 'iPhone' });
+  assert.equal(ja.label, 'iPhone');
+  assert.equal(jb.label, 'iPhone 2');
+  const c = await connected(client());
+  const jc = await call(c, 'room:join', { code, clientId: 'nameC' + ipSeq, name: '   ' });
+  assert.equal(jc.label, 'User 1');
+});
+
 test('wrong guesses spread over many addresses hit a site-wide cap', async () => {
   // A room someone was already in before the attack starts.
   const host = await connected(client({ ip: '10.67.0.1' }));

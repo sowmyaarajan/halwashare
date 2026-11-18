@@ -49,6 +49,24 @@
 
       <div id="share-pending" class="share-pending hidden" role="status"></div>
 
+      <div id="invite-in" class="invite-in hidden" role="alertdialog" aria-live="assertive"></div>
+
+      <section id="devices" class="card devices-card" aria-label="Devices">
+        <h2 class="devices-title">Your devices</h2>
+        <ul id="my-devices" class="device-list"></ul>
+        <p id="my-devices-empty" class="devices-empty">
+          In a room, tap a person and choose <strong>Remember this device</strong>.
+          It then shows up here, and one tap connects you — no code.
+        </p>
+
+        <h2 class="devices-title">Nearby on this network</h2>
+        <ul id="nearby" class="device-list"></ul>
+        <p id="nearby-empty" class="devices-empty">Open HalwaShare on another device on this Wi-Fi and it appears here.</p>
+
+        <p class="device-self">This device: <strong id="device-name"></strong>
+          <button id="btn-rename" class="link-btn" type="button">Rename</button></p>
+      </section>
+
       <ul class="features">
         <li><span>⚡</span><div><strong>No size limit</strong>Huge files stream straight to disk</div></li>
         <li><span>🔒</span><div><strong>Peer to peer</strong>Encrypted, never stored on a server</div></li>
@@ -58,7 +76,8 @@
     </main>
 
     <div id="install-box" class="install-box hidden">
-      <button id="btn-install" class="btn btn-secondary btn-sm hidden" type="button">📲 Install the app</button>
+      <button id="btn-install" class="btn btn-secondary btn-sm hidden" type="button">📲 Install HalwaShare</button>
+      <p id="install-desktop" class="install-hint hidden">Opens in its own window, with an icon on your taskbar or dock — no link to type.</p>
       <p id="install-ios" class="install-hint hidden">
         📲 Install on iPhone: in Safari tap <strong>Share</strong> (the square with an arrow), then <strong>Add to Home Screen</strong>.
       </p>

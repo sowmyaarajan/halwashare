@@ -14,11 +14,31 @@ code in the room sidebar.
 ## In a room
 
 - **Files of any size**: offered instantly, streamed when someone saves them, resumed if the connection drops.
+- **Whole folders** (📎 → Folder, or drag one in, on a computer): they arrive as one .zip, built while it streams, so even a huge folder never sits in memory.
+- **What I copied** (📎): sends the text or picture on your clipboard; the others tap Copy.
+- **Share my screen** (📎, on a computer): everyone in the room watches live, over a direct link.
 - **Chat**, with read receipts, a typing indicator and pasted screenshots.
 - **Voice notes**: tap 🎙️, speak, tap ⏹. They arrive on their own and play inline.
 - **Safety code**: tap a person to see twelve pictures. If their screen shows the same twelve, your direct link goes straight to them, with nobody in between.
 - **Screen stays on** while others are in the room, so a phone does not sleep and drop out (☕ turns this off).
 - **Background alerts**: a count in the tab title and on the app icon, plus a notification if you allow it, when something arrives while HalwaShare is not on screen.
+
+## No code needed
+
+- **Nearby**: other devices with HalwaShare open on the same network (the same public address) show on the start page and under 📡 in a room. Tap *Connect* and they are asked to join.
+- **Your devices**: in a room, tap a person and choose *Remember this device*. From then on it appears on the start page whenever it is online, and *Connect* takes both straight into a new room, no questions asked. *✕* forgets it on both sides.
+
+Each device has a name (shown in rooms instead of "User 2"), which *Rename* on the start page changes.
+A remembered pair shares a random token made of a half from each side; the server only matches tokens and never learns which devices are behind them.
+
+## Browser extension
+
+`extension/` is a Chrome / Edge extension:
+
+- the toolbar button opens HalwaShare, or brings its tab to the front;
+- right-click any picture, link, selected text or page and choose **Send to HalwaShare**. The page always asks before anything is sent.
+
+To install it before it is in the Chrome Web Store: open `chrome://extensions` (or `edge://extensions`), turn on **Developer mode**, click **Load unpacked** and pick the `extension` folder.
 
 ## Install it as an app
 
@@ -29,7 +49,7 @@ instead of behind a link. It needs the HTTPS deployment.
 |---|---|
 | Android | Open the site in Chrome and tap **Install app** (or ⋮ → *Install app*) |
 | iPhone / iPad | Open the site in Safari, tap **Share** → **Add to Home Screen** |
-| Windows / Mac | Chrome or Edge: the install icon in the address bar, or the *Install the app* button |
+| Windows / Mac | Chrome or Edge: the install icon in the address bar, the *Install HalwaShare* button on the start page, or 📲 in a room. It then opens in its own window from the Start menu, taskbar or dock |
 
 Once installed on Android, HalwaShare also appears in the **Share** menu:
 share photos from the gallery, enter a room, and HalwaShare lists them and
@@ -235,3 +255,8 @@ transfer tag so several files can share one link without mixing up.
 | `end` | owner → receiver | that was the last chunk |
 | `ack` | receiver → owner | relay flow control |
 | `err` | owner → receiver | could not serve it |
+| `pair-req` / `pair-ok` / `pair-no` | either way | remember this device: each side sends half of the pairing secret |
+
+Screen sharing uses its own `RTCPeerConnection` per viewer, signalled with `scr-offer`, `scr-answer`, `scr-ice` and `scr-stop` through `rtc:signal`.
+
+Presence events (socket.io): `presence:hello` (name, kind, device id, pairing tokens), `presence:nearby`, `presence:paired`, `presence:invite` → `presence:invited`, `presence:forget` → `presence:forgotten`.

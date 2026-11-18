@@ -81,12 +81,28 @@ function generateCode() {
   return null;
 }
 
-function assignLabel(room) {
+function assignLabel(room, wanted) {
   const used = new Set(room.users.map(u => u.label));
+  // The device's own name when it gave one, made unique within the room.
+  if (wanted) {
+    if (!used.has(wanted)) return wanted;
+    for (let i = 2; i <= MAX_USERS + 1; i++) {
+      if (!used.has(wanted + ' ' + i)) return wanted + ' ' + i;
+    }
+  }
   for (let i = 1; i <= MAX_USERS; i++) {
     if (!used.has('User ' + i)) return 'User ' + i;
   }
   return null;
+}
+
+/* A display name a device chose for itself: printable, short, single line. */
+const NAME_MAX = 32;
+function cleanName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, '')
+    .replace(/\s+/g, ' ').trim().slice(0, NAME_MAX).trim();
+  return name || null;
 }
 
 /* Bounded by count and by bytes, so a chatty room cannot hoard memory. */
@@ -194,6 +210,8 @@ const LIMITS = {
   offer:   [2, 20],
   qr:      [1, 20],
   misc:    [20, 60],
+  presence: [1, 10],
+  invite:  [1 / 3, 6],
 };
 
 const ipBuckets = new Map(); // ip -> { kind -> Bucket }, oldest first
@@ -267,6 +285,76 @@ function ipKey(ip) {
     ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t]
     : h;
   return groups.slice(0, 4).map(g => (parseInt(g, 16) || 0).toString(16)).join(':') + '::/64';
+}
+
+/* ── Presence ──────────────────────────────────────────────────
+   Two ways to find a device without a room code:
+     nearby  — other HalwaShare pages behind the same public address,
+               which almost always means the same Wi-Fi
+     paired  — devices that chose to remember each other. Each pair shares
+               a random token; the server only matches tokens, it never
+               learns which devices or names are behind them. */
+const nets = new Map();        // ip key -> Set(socket)
+const pairTokens = new Map();  // token -> Set(socket)
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const KINDS = new Set(['phone', 'tablet', 'laptop', 'desktop']);
+const MAX_NEARBY = 20;
+const CROWDED_NET = 200;       // an office or campus: too many to list
+
+function addTo(map, key, socket) {
+  let set = map.get(key);
+  if (!set) { set = new Set(); map.set(key, set); }
+  set.add(socket);
+}
+function removeFrom(map, key, socket) {
+  const set = map.get(key);
+  if (!set) return;
+  set.delete(socket);
+  if (!set.size) map.delete(key);
+}
+
+function nearbyFor(socket) {
+  const set = nets.get(socket.data.ip);
+  if (!set || set.size > CROWDED_NET) return [];
+  const me = socket.data.presence;
+  const list = [];
+  for (const s of set) {
+    const p = s.data.presence;
+    if (s === socket || !p || (me && p.device === me.device)) continue;
+    list.push({ id: p.nid, name: p.name, kind: p.kind, at: p.at });
+  }
+  return list.sort((a, b) => b.at - a.at).slice(0, MAX_NEARBY)
+    .map(({ at, ...rest }) => rest);
+}
+
+function announceNearby(ip) {
+  const set = nets.get(ip);
+  if (!set || set.size > CROWDED_NET) return;
+  for (const s of set) s.emit('presence:nearby', nearbyFor(s));
+}
+
+/* Is a paired device — some socket with this token on another device — online? */
+function pairedOnline(token, socket) {
+  const set = pairTokens.get(token);
+  const me = socket.data.presence;
+  if (!set || !me) return false;
+  for (const s of set) if (s !== socket && s.data.presence && s.data.presence.device !== me.device) return true;
+  return false;
+}
+
+function announcePaired(token) {
+  const set = pairTokens.get(token);
+  if (!set) return;
+  for (const s of set) s.emit('presence:paired', { token, online: pairedOnline(token, s) });
+}
+
+function leavePresence(socket) {
+  const p = socket.data.presence;
+  if (!p) return;
+  socket.data.presence = null;
+  removeFrom(nets, socket.data.ip, socket);
+  for (const t of p.tokens) { removeFrom(pairTokens, t, socket); announcePaired(t); }
+  announceNearby(socket.data.ip);
 }
 
 /* ── HTTP ──────────────────────────────────────────────────── */
@@ -431,22 +519,8 @@ io.on('connection', (socket) => {
     if (typeof arg === 'function') { cb = arg; arg = null; }
     if (typeof cb !== 'function') return;
     if (!ipBucket(ip, 'create').take(1)) return cb({ error: SLOW_DOWN });
-    const codes = Object.keys(rooms);
-    if (codes.filter(c => rooms[c].ownerIp === ip).length >= MAX_ROOMS_PER_IP) {
-      return cb({ error: 'You have too many rooms open. Close one first.' });
-    }
-    if (codes.length >= MAX_ROOMS) {
-      return cb({ error: 'HalwaShare is busy right now. Please try again in a few minutes.' });
-    }
-    const code = generateCode();
-    if (!code) return cb({ error: 'HalwaShare is busy right now. Please try again in a few minutes.' });
-    const room = { code, users: [], history: [], historyBytes: 0, expiry: null, ownerIp: ip, members: new Set() };
-    rooms[code] = room;
-    // The creator's tab goes straight on to join; let it in whatever the
-    // guessing budget says.
-    if (arg && typeof arg.clientId === 'string' && ID_RE.test(arg.clientId)) rememberMember(room, arg.clientId);
-    scheduleExpiry(room);
-    cb({ code });
+    const res = createRoom(ip, arg && arg.clientId);
+    cb(res.error ? { error: res.error } : { code: res.code });
   });
 
   on('room:check', (arg, cb) => {
@@ -493,7 +567,10 @@ io.on('connection', (socket) => {
       if (room.users.length >= MAX_USERS) {
         return reply({ error: 'This room is full (' + MAX_USERS + '/' + MAX_USERS + '). Ask someone to leave first.' });
       }
-      member = { pid: newPid(), clientId: clientId || newPid(), label: assignLabel(room), sid: socket.id, awayTimer: null };
+      member = {
+        pid: newPid(), clientId: clientId || newPid(),
+        label: assignLabel(room, cleanName((arg || {}).name)), sid: socket.id, awayTimer: null,
+      };
       room.users.push(member);
     }
     clearTimeout(room.expiry);
@@ -554,6 +631,88 @@ io.on('connection', (socket) => {
     socket.data.code = null;
     if (code) socket.leave(code);
   });
+
+  /* ── Presence: nearby and paired devices ────────────────── */
+  on('presence:hello', (arg) => {
+    if (!arg || typeof arg !== 'object' || !allow('presence')) return;
+    const name = cleanName(arg.name);
+    const device = typeof arg.device === 'string' && ID_RE.test(arg.device) ? arg.device : null;
+    if (!name || !device) return;
+    const tokens = Array.isArray(arg.tokens)
+      ? [...new Set(arg.tokens.filter(t => typeof t === 'string' && TOKEN_RE.test(t)))].slice(0, 50) : [];
+    const prev = socket.data.presence;
+    if (prev) leavePresence(socket);
+    socket.data.presence = {
+      nid: (prev && prev.nid) || newPid(),
+      name,
+      kind: KINDS.has(arg.kind) ? arg.kind : 'desktop',
+      device,
+      clientId: typeof arg.clientId === 'string' && ID_RE.test(arg.clientId) ? arg.clientId : null,
+      tokens: new Set(tokens),
+      at: Date.now(),
+    };
+    addTo(nets, ip, socket);
+    for (const t of tokens) addTo(pairTokens, t, socket);
+    announceNearby(ip);
+    for (const t of tokens) announcePaired(t);
+  });
+
+  /* Invite a nearby or paired device into a room: this one, or a new one. */
+  on('presence:invite', (arg, cb) => {
+    const reply = typeof cb === 'function' ? cb : () => {};
+    const me = socket.data.presence;
+    if (!me || !arg || typeof arg !== 'object') return reply({ error: 'Bad request.' });
+    if (!allow('invite')) return reply({ error: SLOW_DOWN });
+
+    let targets = [];
+    let token = null;
+    if (typeof arg.token === 'string' && me.tokens.has(arg.token)) {
+      token = arg.token;
+      targets = [...(pairTokens.get(token) || [])]
+        .filter(s => s !== socket && s.data.presence && s.data.presence.device !== me.device);
+    } else if (typeof arg.to === 'string') {
+      targets = [...(nets.get(ip) || [])]
+        .filter(s => s !== socket && s.data.presence && s.data.presence.nid === arg.to);
+    }
+    if (!targets.length) return reply({ error: 'That device is not online any more.' });
+
+    let room;
+    let code;
+    if (arg.code !== undefined) {
+      // Only into the room the inviter is actually in.
+      if (arg.code !== socket.data.code || !rooms[arg.code]) return reply({ error: 'Bad request.' });
+      code = arg.code;
+      room = rooms[code];
+      if (room.users.length >= MAX_USERS) return reply({ error: 'This room is full.' });
+    } else {
+      if (!ipBucket(ip, 'create').take(1)) return reply({ error: SLOW_DOWN });
+      const res = createRoom(ip, typeof arg.clientId === 'string' ? arg.clientId : null);
+      if (res.error) return reply({ error: res.error });
+      ({ code, room } = res);
+    }
+    for (const s of targets) {
+      // Invited, so let their tab in like a member.
+      const cid = s.data.presence.clientId;
+      if (cid) rememberMember(room, cid);
+      s.emit('presence:invited', { code, from: me.name, kind: me.kind, token, nid: me.nid });
+    }
+    reply({ code });
+  });
+
+  /* Forgetting a pairing tells the other device to forget it too. */
+  on('presence:forget', (arg) => {
+    const me = socket.data.presence;
+    const token = arg && arg.token;
+    if (!me || typeof token !== 'string' || !me.tokens.has(token) || !allow('misc')) return;
+    for (const s of pairTokens.get(token) || []) {
+      if (s !== socket) s.emit('presence:forgotten', { token });
+    }
+    me.tokens.delete(token);
+    removeFrom(pairTokens, token, socket);
+    announcePaired(token);
+  });
+
+  on('disconnect', () => leavePresence(socket));
 
   /* Lets a page that just woke up check its connection is really alive. */
   on('room:ping', (cb) => { if (typeof cb === 'function' && allow('misc')) cb(true); });
@@ -727,6 +886,26 @@ io.on('connection', (socket) => {
     if (member.awayTimer.unref) member.awayTimer.unref();
   });
 });
+
+/* Shared by "Create a room" and by inviting a device into a new one. */
+function createRoom(ip, clientId) {
+  const codes = Object.keys(rooms);
+  if (codes.filter(c => rooms[c].ownerIp === ip).length >= MAX_ROOMS_PER_IP) {
+    return { error: 'You have too many rooms open. Close one first.' };
+  }
+  if (codes.length >= MAX_ROOMS) {
+    return { error: 'HalwaShare is busy right now. Please try again in a few minutes.' };
+  }
+  const code = generateCode();
+  if (!code) return { error: 'HalwaShare is busy right now. Please try again in a few minutes.' };
+  const room = { code, users: [], history: [], historyBytes: 0, expiry: null, ownerIp: ip, members: new Set() };
+  rooms[code] = room;
+  // The creator's tab goes straight on to join; let it in whatever the
+  // guessing budget says.
+  if (typeof clientId === 'string' && ID_RE.test(clientId)) rememberMember(room, clientId);
+  scheduleExpiry(room);
+  return { code, room };
+}
 
 function removeMember(room, member) {
   clearTimeout(member.awayTimer);

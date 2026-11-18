@@ -201,6 +201,228 @@ function getClientId() {
   } catch (_) { return uid(); }
 }
 
+/* ── This device, and the devices it remembers ─────────────────
+   A device has a name people see ("Windows PC · Mango") and a random id
+   that only tells its own tabs apart on the server. A remembered device
+   is a shared random token: both sides hold it, the server only matches
+   it, and nobody else can produce it. */
+const PAIR_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const NICKNAMES = ['Mango', 'Pista', 'Kaju', 'Badam', 'Jalebi', 'Laddu', 'Barfi', 'Kulfi',
+  'Peda', 'Rasgulla', 'Kesar', 'Chikki', 'Rabri', 'Imarti', 'Modak', 'Payasam'];
+
+function detectKind() {
+  const ua = navigator.userAgent;
+  if (/iPad/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) return 'tablet';
+  if (/Android/.test(ua) && !/Mobile/.test(ua)) return 'tablet';
+  if (/iPhone|iPod|Android|Mobile/.test(ua)) return 'phone';
+  return 'laptop';
+}
+
+function defaultDeviceName(kind) {
+  const ua = navigator.userAgent;
+  let base = 'Computer';
+  if (/iPhone|iPod/.test(ua)) base = 'iPhone';
+  else if (kind === 'tablet' && !/Android/.test(ua)) base = 'iPad';
+  else if (/Android/.test(ua)) base = kind === 'tablet' ? 'Android tablet' : 'Android phone';
+  else if (/CrOS/.test(ua)) base = 'Chromebook';
+  else if (/Mac/.test(ua)) base = 'Mac';
+  else if (/Windows/.test(ua)) base = 'Windows PC';
+  else if (/Linux/.test(ua)) base = 'Linux PC';
+  const nick = NICKNAMES[crypto.getRandomValues(new Uint8Array(1))[0] % NICKNAMES.length];
+  return base + ' · ' + nick;
+}
+
+function cleanDeviceName(v) {
+  return String(v || '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 32).trim();
+}
+
+let deviceCache = null;
+function getDevice() {
+  if (deviceCache) return deviceCache;
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem('halwa-device') || 'null'); } catch (_) {}
+  if (!d || typeof d.id !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(d.id) || !cleanDeviceName(d.name)) {
+    const kind = detectKind();
+    d = { id: uid(), name: defaultDeviceName(kind), kind };
+    try { localStorage.setItem('halwa-device', JSON.stringify(d)); } catch (_) {}
+  }
+  d.kind = ['phone', 'tablet', 'laptop', 'desktop'].includes(d.kind) ? d.kind : detectKind();
+  d.name = cleanDeviceName(d.name);
+  deviceCache = d;
+  return d;
+}
+
+function renameDevice(name) {
+  const clean = cleanDeviceName(name);
+  if (!clean) return false;
+  const d = getDevice();
+  d.name = clean;
+  try { localStorage.setItem('halwa-device', JSON.stringify(d)); } catch (_) {}
+  return true;
+}
+
+function getPaired() {
+  try {
+    const list = JSON.parse(localStorage.getItem('halwa-paired') || '[]');
+    return Array.isArray(list) ? list.filter(p => p && PAIR_TOKEN_RE.test(p.token) && typeof p.name === 'string') : [];
+  } catch (_) { return []; }
+}
+
+function savePaired(list) {
+  try { localStorage.setItem('halwa-paired', JSON.stringify(list.slice(0, 50))); } catch (_) {}
+}
+
+function addPaired(rec) {
+  // Pairing the same device again replaces the old pairing.
+  const list = getPaired().filter(p => p.token !== rec.token && !(rec.device && p.device === rec.device));
+  list.unshift(rec);
+  savePaired(list);
+}
+
+function removePaired(token) {
+  savePaired(getPaired().filter(p => p.token !== token));
+}
+
+function kindIcon(kind) {
+  return kind === 'phone' || kind === 'tablet' ? '📱' : kind === 'desktop' ? '🖥️' : '💻';
+}
+
+function b64url(bytes) {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function randomPart() {
+  return b64url(crypto.getRandomValues(new Uint8Array(32)));   // 43 characters
+}
+
+async function pairToken(requesterPart, responderPart) {
+  const digest = await crypto.subtle.digest('SHA-256',
+    new TextEncoder().encode('halwa-pair-v1|' + requesterPart + '|' + responderPart));
+  return b64url(new Uint8Array(digest));
+}
+
+/* Tells the server who this page is, and keeps the lists of nearby and
+   remembered devices current. Used by the start page and by rooms. */
+function startPresence(socket, on) {
+  const state = { nearby: [], online: new Map() };
+  function hello() {
+    const d = getDevice();
+    socket.emit('presence:hello', {
+      name: d.name, kind: d.kind, device: d.id, clientId: getClientId(),
+      tokens: getPaired().map(p => p.token),
+    });
+  }
+  socket.on('connect', hello);
+  if (socket.connected) hello();
+  socket.on('presence:nearby', (list) => { state.nearby = Array.isArray(list) ? list : []; on.change(); });
+  socket.on('presence:paired', ({ token, online }) => { state.online.set(token, !!online); on.change(); });
+  socket.on('presence:forgotten', ({ token }) => {
+    if (!getPaired().some(p => p.token === token)) return;
+    removePaired(token);
+    state.online.delete(token);
+    hello();
+    on.change();
+  });
+  socket.on('presence:invited', (inv) => {
+    if (!inv || typeof inv.code !== 'string' || !/^\d{6}$/.test(inv.code)) return;
+    const paired = inv.token ? getPaired().find(p => p.token === inv.token) : null;
+    on.invited(Object.assign({}, inv, { paired, from: paired ? paired.name : cleanDeviceName(inv.from) || 'A device' }));
+  });
+  return {
+    state,
+    hello,
+    invite(target, code) {
+      return new Promise((resolve) => {
+        const arg = Object.assign({ clientId: getClientId() }, target);
+        if (code) arg.code = code;
+        socket.timeout(8000).emit('presence:invite', arg, (err, res) => {
+          resolve(err ? { error: 'No answer from the server. Try again.' } : (res || { error: 'Try again.' }));
+        });
+      });
+    },
+    forget(token) {
+      socket.emit('presence:forget', { token });
+      removePaired(token);
+      state.online.delete(token);
+      hello();
+      on.change();
+    },
+    /* Remembered devices first (online ones on top), then strangers nearby. */
+    list() {
+      const paired = getPaired().map(p => ({ paired: true, token: p.token, name: p.name, kind: p.kind, online: !!state.online.get(p.token) }));
+      paired.sort((a, b) => Number(b.online) - Number(a.online));
+      // A remembered device that is online is listed once, under its pairing.
+      const known = new Set(paired.filter(p => p.online).map(p => p.name));
+      const nearby = state.nearby
+        .map(n => ({ paired: false, id: n.id, name: cleanDeviceName(n.name), kind: n.kind, online: true }))
+        .filter(n => !known.has(n.name));
+      return { paired, nearby };
+    },
+  };
+}
+
+/* One row in a device list. */
+function deviceRow(dev, actionLabel, onAction, onForget) {
+  const li = document.createElement('li');
+  li.className = 'device-item' + (dev.online ? '' : ' offline');
+  const icon = document.createElement('span');
+  icon.className = 'device-icon';
+  icon.textContent = kindIcon(dev.kind);
+  const text = document.createElement('span');
+  text.className = 'device-text';
+  const name = document.createElement('span');
+  name.className = 'device-name';
+  name.textContent = dev.name;
+  const st = document.createElement('span');
+  st.className = 'device-state';
+  st.textContent = dev.paired ? (dev.online ? 'online' : 'offline') : 'nearby';
+  text.append(name, st);
+  li.append(icon, text);
+  if (dev.online) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-primary btn-sm';
+    btn.textContent = actionLabel;
+    btn.addEventListener('click', () => onAction(dev, btn));
+    li.appendChild(btn);
+  }
+  if (onForget) {
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'device-forget';
+    x.title = 'Forget ' + dev.name;
+    x.setAttribute('aria-label', 'Forget ' + dev.name);
+    x.textContent = '✕';
+    x.addEventListener('click', () => onForget(dev));
+    li.appendChild(x);
+  }
+  return li;
+}
+
+/* Things sent from the HalwaShare browser extension. Its script runs in
+   this page and posts here; nothing from another site can, because the
+   message must come from this very window and origin. */
+function onExtensionItem(handler) {
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || e.origin !== location.origin) return;
+    const d = e.data;
+    if (!d || d.source !== 'halwa-ext' || !d.item || typeof d.item !== 'object') return;
+    const item = d.item;
+    const text = typeof item.text === 'string' ? item.text.slice(0, 4000) : '';
+    let file = null;
+    if (item.file && typeof item.file.data === 'string' && item.file.data.length < 40 * 1024 * 1024) {
+      try {
+        const bin = atob(item.file.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        file = new File([bytes], cleanDeviceName(item.file.name) || 'image',
+          { type: typeof item.file.type === 'string' ? item.file.type.slice(0, 100) : '' });
+      } catch (_) { file = null; }
+    }
+    if (text || file) handler({ text, files: file ? [file] : [] });
+  });
+}
+
 /* ── Service worker ────────────────────────────────────────────
    Registered on every page: the installed app opens on the landing
    page, and that is where shared files arrive. */
@@ -299,7 +521,10 @@ if (!isRoomPage) {
      whatever is parked is thrown away unseen. */
   readSharedIndex().then((index) => {
     if (!index) return;
-    if (!isStandalone()) { clearShared(); return; }
+    // Parked by the extension in this very tab: keep it.
+    let armedHere = false;
+    try { armedHere = sessionStorage.getItem(SHARE_ARMED) === '1'; } catch (_) {}
+    if (!isStandalone() && !armedHere) { clearShared(); return; }
     try { sessionStorage.setItem(SHARE_ARMED, '1'); } catch (_) {}
     const n = index.files.length;
     const what = n
@@ -324,6 +549,7 @@ if (!isRoomPage) {
       e.preventDefault();
       installPrompt = e;
       btnInstall.classList.remove('hidden');
+      document.getElementById('install-desktop').classList.toggle('hidden', detectKind() !== 'laptop');
       installBox.classList.remove('hidden');
     });
     const iOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
@@ -365,6 +591,93 @@ if (!isRoomPage) {
       window.location.href = '/join/' + code;
     });
   }
+
+  /* ── Devices: remembered and nearby ────────────────────────── */
+  const myDevicesEl = document.getElementById('my-devices');
+  const nearbyEl = document.getElementById('nearby');
+  const inviteIn = document.getElementById('invite-in');
+  const deviceNameEl = document.getElementById('device-name');
+  deviceNameEl.textContent = getDevice().name;
+
+  const presence = startPresence(socket, { change: renderDevices, invited: onInvited });
+
+  function renderDevices() {
+    const { paired, nearby } = presence.list();
+    myDevicesEl.replaceChildren(...paired.map(d => deviceRow(d, 'Connect', connectTo, forgetDevice)));
+    nearbyEl.replaceChildren(...nearby.map(d => deviceRow(d, 'Connect', connectTo)));
+    document.getElementById('my-devices-empty').classList.toggle('hidden', paired.length > 0);
+    document.getElementById('nearby-empty').classList.toggle('hidden', nearby.length > 0);
+  }
+  renderDevices();
+
+  async function connectTo(dev, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Connecting…';
+    const res = await presence.invite(dev.paired ? { token: dev.token } : { to: dev.id });
+    if (res.code) { window.location.href = '/join/' + res.code; return; }
+    showError(res.error || 'Could not connect. Try again.');
+    btn.disabled = false;
+    btn.textContent = 'Connect';
+  }
+
+  function forgetDevice(dev) {
+    if (!window.confirm('Forget ' + dev.name + '? It will forget this device too.')) return;
+    presence.forget(dev.token);
+  }
+
+  /* A remembered device that connects to us opens the room at once — that
+     is the point of remembering it. Anyone else nearby has to be accepted. */
+  let inviteTimer = null;
+  function onInvited(inv) {
+    if (inv.paired) { window.location.href = '/join/' + inv.code; return; }
+    inviteIn.replaceChildren();
+    const p = document.createElement('p');
+    p.className = 'invite-in-text';
+    p.textContent = kindIcon(inv.kind) + ' ' + inv.from + ' wants to share with you.';
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const no = document.createElement('button');
+    no.type = 'button'; no.className = 'btn btn-ghost btn-sm'; no.textContent = 'Decline';
+    const yes = document.createElement('button');
+    yes.type = 'button'; yes.className = 'btn btn-primary btn-sm'; yes.textContent = 'Join';
+    actions.append(no, yes);
+    inviteIn.append(p, actions);
+    inviteIn.classList.remove('hidden');
+    yes.focus();
+    const close = () => { inviteIn.classList.add('hidden'); clearTimeout(inviteTimer); };
+    no.addEventListener('click', close);
+    yes.addEventListener('click', () => { window.location.href = '/join/' + inv.code; });
+    clearTimeout(inviteTimer);
+    inviteTimer = setTimeout(close, 60000);
+  }
+
+  document.getElementById('btn-rename').addEventListener('click', () => {
+    const name = window.prompt('Name this device — others see it in rooms and nearby lists:', getDevice().name);
+    if (name === null) return;
+    if (!renameDevice(name)) return showError('Pick a name with at least one letter.');
+    deviceNameEl.textContent = getDevice().name;
+    presence.hello();
+  });
+
+  /* The extension hands over a picture, link or text: keep it, like a
+     share from the phone's Share menu, until a room is open. */
+  onExtensionItem(async ({ text, files }) => {
+    try {
+      await clearShared();
+      const cache = await caches.open(SHARE_CACHE);
+      for (let i = 0; i < files.length; i++) {
+        await cache.put('/__shared/' + i, new Response(files[i], { headers: { 'Content-Type': files[i].type || 'application/octet-stream' } }));
+      }
+      await cache.put('/__shared/index', new Response(JSON.stringify({
+        files: files.map(f => ({ name: f.name, type: f.type, size: f.size })), text, at: Date.now(),
+      }), { headers: { 'Content-Type': 'application/json' } }));
+      sessionStorage.setItem(SHARE_ARMED, '1');
+    } catch (_) { return; }
+    const el = document.getElementById('share-pending');
+    el.textContent = '📎 ' + (files.length ? files[0].name : 'Your text') +
+      ' is ready. Create or join a room, or tap a device, and you can send it from there.';
+    el.classList.remove('hidden');
+  });
 }
 
 /* ── Download sinks ────────────────────────────────────────────
@@ -586,7 +899,7 @@ if (isRoomPage) {
   function join() {
     const first = !joined;
     socket.emit('room:join', {
-      code: urlCode, clientId,
+      code: urlCode, clientId, name: getDevice().name,
       fresh: first,                 // a newly loaded page holds no old links or files
       files: [...myFiles.keys()],   // what we can still send
     }, (res) => {
@@ -700,7 +1013,6 @@ if (isRoomPage) {
   }
 
   async function offerSharedFiles() {
-    if (!isStandalone()) return;
     let armed = false;
     try { armed = sessionStorage.getItem(SHARE_ARMED) === '1'; sessionStorage.removeItem(SHARE_ARMED); } catch (_) {}
     if (!armed) return;
@@ -805,7 +1117,7 @@ if (isRoomPage) {
         ? '<span class="safety-badge" title="Verified link available — tap to compare the safety code">🔐</span>' : '';
       return '<li class="user-item' + (u.away ? ' away' : '') + (self ? '' : ' tappable') + '"' +
         (self ? '' : ' data-id="' + escapeHtml(u.id) + '" tabindex="0" role="button" title="Safety code with ' + escapeHtml(u.label) + '"') + '>' +
-        '<span class="avatar">' + escapeHtml(u.label.replace(/\D/g, '') || '?') + '</span>' +
+        '<span class="avatar">' + escapeHtml(avatarText(u.label)) + '</span>' +
         '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you)' : u.away ? ' · reconnecting…' : '') + '</span>' +
         lock + badge +
       '</li>';
@@ -813,6 +1125,7 @@ if (isRoomPage) {
     $('user-count').textContent = users.length;
     syncWakeLock();
     if (users.some(u => u.id !== myId && !u.away)) maybeAskNotify();
+    if (typeof paintNearbyCount === 'function') paintNearbyCount();
   }
 
   userListEl.addEventListener('click', (e) => {
@@ -824,6 +1137,13 @@ if (isRoomPage) {
     const item = e.target.closest('.user-item[data-id]');
     if (item) { e.preventDefault(); showSafety(item.dataset.id); }
   });
+
+  /* "User 2" shows 2; a device name shows its first letter. */
+  function avatarText(label) {
+    if (/^User \d+$/.test(label)) return label.slice(5);
+    const first = Array.from(String(label).trim())[0] || '?';
+    return first.toUpperCase();
+  }
 
   function modeLabel(mode) {
     if (mode === 'p2p') return 'direct';
@@ -1073,6 +1393,7 @@ if (isRoomPage) {
 
   /* Gone for good: stop everything to do with them. */
   function dropPeer(id, reason) {
+    closeScreenFor(id);
     const peer = peers.get(id);
     if (!peer) return;
     peer.settle('dead');
@@ -1166,11 +1487,15 @@ if (isRoomPage) {
     const peer = existing ? resetPeer(id, label) : ensurePeer(id, label);
     startOffer(peer); // the established side always offers
     refreshUsers();
+    if (screenStream) setTimeout(() => { if (screenStream) shareScreenTo(id); }, 1200);
   });
 
   socket.on('rtc:peer-left', ({ id }) => dropPeer(id, 'the sender left the room'));
 
   socket.on('rtc:signal', async ({ from, payload }) => {
+    if (payload && typeof payload.type === 'string' && payload.type.startsWith('scr-')) {
+      return handleScreenSignal(from, payload);
+    }
     let peer = ensurePeer(from);
     try {
       if (payload.type === 'reset') {
@@ -1309,6 +1634,21 @@ if (isRoomPage) {
 
       case 'ack':                    // relay flow control
         peer.creditRelay(msg.bytes || 0);
+        break;
+
+      case 'pair-req':               // they want to remember this device
+        if (PAIR_TOKEN_RE.test(msg.part)) askPair(peer, msg);
+        break;
+
+      case 'pair-ok':                // they agreed
+        finishPair(peer, msg);
+        break;
+
+      case 'pair-no':
+        if (pairPending.has(peer.id)) {
+          pairPending.delete(peer.id);
+          toast(peer.label + ' chose not to remember this device');
+        }
         break;
 
       case 'got': {                  // a receiver confirmed the whole file
@@ -1474,6 +1814,18 @@ if (isRoomPage) {
     e.preventDefault();
     dragDepth = 0;
     dropZone.classList.add('hidden');
+    // Entries must be taken now, inside the event; they vanish after it.
+    const entries = [...(e.dataTransfer.items || [])]
+      .map(i => (i.kind === 'file' && i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+    if (entries.some(en => en && en.isDirectory)) {
+      const files = [...(e.dataTransfer.files || [])];
+      entries.forEach((en, i) => {
+        if (en && en.isDirectory) offerDroppedFolder(en);
+        else if (files[i]) offerFile(files[i]);
+        else if (en && en.isFile) en.file(offerFile);
+      });
+      return;
+    }
     [...(e.dataTransfer.files || [])].forEach(offerFile);
   });
 
@@ -2385,7 +2737,19 @@ if (isRoomPage) {
     close.type = 'button';
     close.className = 'btn btn-primary btn-sm';
     close.textContent = 'Done';
-    card.append(h, code, p, close);
+    const actions = document.createElement('div');
+    actions.className = 'safety-actions';
+    if (peer && !user.away && (peer.mode === 'p2p' || peer.mode === 'relay')) {
+      const remember = document.createElement('button');
+      remember.type = 'button';
+      remember.className = 'btn btn-secondary btn-sm';
+      remember.textContent = '📌 Remember this device';
+      remember.title = 'Next time, connect to ' + name + ' with one tap from the start page — no code';
+      remember.addEventListener('click', () => { requestPair(peer); done(); });
+      actions.appendChild(remember);
+    }
+    actions.appendChild(close);
+    card.append(h, code, p, actions);
     sheet.appendChild(card);
     document.body.appendChild(sheet);
     close.focus();
@@ -2493,6 +2857,460 @@ if (isRoomPage) {
     if (document.visibilityState === 'hidden' && rec && !rec.pending) stopRecording(false);
   });
 
+  /* ── Remember a device ───────────────────────────────────────
+     Both sides add half of the secret, so neither can choose it alone.
+     The halves travel over the direct link when there is one. */
+  const pairPending = new Map();   // peer id -> our half
+
+  function requestPair(peer) {
+    const part = randomPart();
+    pairPending.set(peer.id, part);
+    const d = getDevice();
+    try {
+      peer.sendCtrl({ t: 'pair-req', part, name: d.name, kind: d.kind, device: d.id });
+      toast('Asked ' + peer.label + ' to remember this device…');
+    } catch (_) {
+      pairPending.delete(peer.id);
+      toast('Could not reach ' + peer.label + ' — try again in a moment', 'error');
+    }
+  }
+
+  function askPair(peer, msg) {
+    const theirName = cleanDeviceName(msg.name) || peer.label;
+    const bar = document.createElement('div');
+    bar.className = 'share-confirm';
+    bar.setAttribute('role', 'dialog');
+    const title = document.createElement('p');
+    title.className = 'share-confirm-title';
+    title.textContent = '📌 ' + theirName + ' wants to remember this device, so you can connect with one tap next time, without a code. Only do this with your own devices or people you trust.';
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const no = document.createElement('button');
+    no.type = 'button'; no.className = 'btn btn-ghost btn-sm'; no.textContent = 'Not now';
+    const yes = document.createElement('button');
+    yes.type = 'button'; yes.className = 'btn btn-primary btn-sm'; yes.textContent = 'Remember';
+    actions.append(no, yes);
+    bar.append(title, actions);
+    document.querySelector('.composer').before(bar);
+    no.addEventListener('click', () => {
+      bar.remove();
+      try { peer.sendCtrl({ t: 'pair-no' }); } catch (_) {}
+    });
+    yes.addEventListener('click', async () => {
+      bar.remove();
+      const part = randomPart();
+      const token = await pairToken(msg.part, part);
+      addPaired({
+        token, name: theirName, kind: ['phone', 'tablet', 'laptop', 'desktop'].includes(msg.kind) ? msg.kind : 'laptop',
+        device: typeof msg.device === 'string' ? msg.device.slice(0, 64) : null, at: Date.now(),
+      });
+      const d = getDevice();
+      try { peer.sendCtrl({ t: 'pair-ok', part, name: d.name, kind: d.kind, device: d.id }); } catch (_) {}
+      presence.hello();
+      toast('Remembered ' + theirName + ' — it now shows on your start page');
+    });
+  }
+
+  async function finishPair(peer, msg) {
+    const mine = pairPending.get(peer.id);
+    if (!mine || !PAIR_TOKEN_RE.test(msg.part)) return;
+    pairPending.delete(peer.id);
+    const theirName = cleanDeviceName(msg.name) || peer.label;
+    addPaired({
+      token: await pairToken(mine, msg.part), name: theirName,
+      kind: ['phone', 'tablet', 'laptop', 'desktop'].includes(msg.kind) ? msg.kind : 'laptop',
+      device: typeof msg.device === 'string' ? msg.device.slice(0, 64) : null, at: Date.now(),
+    });
+    presence.hello();
+    toast('Remembered ' + theirName + ' — connect with one tap from the start page next time');
+  }
+
+  /* ── Nearby and remembered devices, from inside a room ─────── */
+  const presence = startPresence(socket, { change: paintNearbyCount, invited: onInvitedInRoom });
+  const nearbyCount = $('nearby-count');
+
+  function paintNearbyCount() {
+    const { paired, nearby } = presence.list();
+    const here = new Set(roomUsers.map(u => u.label));
+    const n = paired.filter(d => d.online && !here.has(d.name)).length + nearby.filter(d => !here.has(d.name)).length;
+    nearbyCount.textContent = n;
+    nearbyCount.classList.toggle('hidden', n === 0);
+    if (openDeviceSheet) openDeviceSheet.render();
+  }
+
+  let openDeviceSheet = null;
+  $('btn-nearby').addEventListener('click', () => {
+    const sheet = document.createElement('div');
+    sheet.className = 'lightbox safety-sheet';
+    const card = document.createElement('div');
+    card.className = 'safety-card devices-sheet';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', 'Invite a device');
+    const h = document.createElement('h3');
+    h.textContent = 'Invite a device into this room';
+    const body = document.createElement('div');
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'btn btn-primary btn-sm';
+    close.textContent = 'Done';
+    card.append(h, body, close);
+    sheet.appendChild(card);
+    document.body.appendChild(sheet);
+
+    async function invite(dev, btn) {
+      btn.disabled = true;
+      btn.textContent = 'Inviting…';
+      const res = await presence.invite(dev.paired ? { token: dev.token } : { to: dev.id }, urlCode);
+      if (res.code) { btn.textContent = 'Invited ✓'; toast('Invite sent to ' + dev.name); }
+      else { btn.disabled = false; btn.textContent = 'Invite'; toast(res.error || 'Could not invite', 'error'); }
+    }
+
+    const render = () => {
+      const { paired, nearby } = presence.list();
+      const here = new Set(roomUsers.map(u => u.label));
+      const sec = (title, list, empty) => {
+        const t = document.createElement('h4');
+        t.className = 'devices-title';
+        t.textContent = title;
+        const ul = document.createElement('ul');
+        ul.className = 'device-list';
+        list.filter(d => !here.has(d.name)).forEach(d => ul.appendChild(deviceRow(d, 'Invite', invite)));
+        const e = document.createElement('p');
+        e.className = 'devices-empty';
+        e.textContent = empty;
+        return ul.children.length ? [t, ul] : [t, e];
+      };
+      body.replaceChildren(
+        ...sec('Your devices', paired, 'None yet. Tap a person in the room and choose Remember this device.'),
+        ...sec('Nearby on this network', nearby, 'Nobody else nearby has HalwaShare open.'),
+      );
+    };
+    render();
+    openDeviceSheet = { render };
+    const done = () => { sheet.remove(); openDeviceSheet = null; document.removeEventListener('keydown', esc); };
+    const esc = (e) => { if (e.key === 'Escape') done(); };
+    document.addEventListener('keydown', esc);
+    close.addEventListener('click', done);
+    sheet.addEventListener('click', (e) => { if (e.target === sheet) done(); });
+  });
+
+  function onInvitedInRoom(inv) {
+    if (inv.code === urlCode) return;
+    const bar = document.createElement('div');
+    bar.className = 'share-confirm';
+    bar.setAttribute('role', 'dialog');
+    const title = document.createElement('p');
+    title.className = 'share-confirm-title';
+    title.textContent = kindIcon(inv.kind) + ' ' + inv.from + ' wants to connect. Joining takes you to a new room.';
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const no = document.createElement('button');
+    no.type = 'button'; no.className = 'btn btn-ghost btn-sm'; no.textContent = 'Not now';
+    const yes = document.createElement('button');
+    yes.type = 'button'; yes.className = 'btn btn-primary btn-sm'; yes.textContent = 'Join';
+    actions.append(no, yes);
+    bar.append(title, actions);
+    document.querySelector('.composer').before(bar);
+    noteArrival(inv.from + ' wants to connect', 'Open HalwaShare to join');
+    no.addEventListener('click', () => bar.remove());
+    yes.addEventListener('click', () => {
+      socket.emit('room:leave');
+      setTimeout(() => { window.location.href = '/join/' + inv.code; }, 150);
+    });
+    setTimeout(() => bar.remove(), 120000);
+  }
+
+  /* ── The 📎 menu ─────────────────────────────────────────────── */
+  const btnAttach = $('btn-attach');
+  const attachMenu = $('attach-menu');
+  const folderInput = $('folder-input');
+  const canFolder = 'webkitdirectory' in folderInput && window.matchMedia('(pointer: fine)').matches;
+  const canClipboard = !!(window.isSecureContext && navigator.clipboard && (navigator.clipboard.read || navigator.clipboard.readText));
+  // Phones cannot share their screen from a browser, even where the call exists.
+  const canScreen = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) && window.matchMedia('(pointer: fine)').matches;
+  attachMenu.querySelector('[data-act="folder"]').classList.toggle('hidden', !canFolder);
+  attachMenu.querySelector('[data-act="clipboard"]').classList.toggle('hidden', !canClipboard);
+  attachMenu.querySelector('[data-act="screen"]').classList.toggle('hidden', !canScreen);
+
+  function setMenu(open) {
+    attachMenu.classList.toggle('hidden', !open);
+    btnAttach.setAttribute('aria-expanded', String(open));
+  }
+  btnAttach.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenu(attachMenu.classList.contains('hidden'));
+  });
+  document.addEventListener('click', (e) => {
+    if (!attachMenu.classList.contains('hidden') && !attachMenu.contains(e.target)) setMenu(false);
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenu(false); });
+  attachMenu.addEventListener('click', (e) => {
+    const item = e.target.closest('[data-act]');
+    if (!item) return;
+    setMenu(false);
+    const act = item.dataset.act;
+    if (act === 'files') fileInput.click();
+    else if (act === 'folder') folderInput.click();
+    else if (act === 'clipboard') sendClipboard();
+    else if (act === 'screen') startScreenShare();
+  });
+
+  /* ── Folders: one zip, built while it streams ─────────────── */
+  const MAX_FOLDER_FILES = 20000;
+
+  folderInput.addEventListener('change', () => {
+    const files = [...folderInput.files];
+    folderInput.value = '';
+    if (!files.length) return toast('That folder is empty');
+    const top = (files[0].webkitRelativePath || '').split('/')[0] || 'Folder';
+    offerFolder(files.map(f => ({ file: f, path: f.webkitRelativePath || f.name })), top);
+  });
+
+  function offerFolder(entries, folderName) {
+    if (!entries.length) return toast(folderName + ' is empty');
+    if (entries.length > MAX_FOLDER_FILES) {
+      return toast('That folder has more than ' + MAX_FOLDER_FILES + ' files. Zip it first and send the zip.', 'error');
+    }
+    const zip = window.HalwaZip.makeZip(entries, (cleanDeviceName(folderName) || 'Folder') + '.zip');
+    offerFile(zip);
+    toast('Folder ready — ' + entries.length + (entries.length === 1 ? ' file' : ' files') + ', arrives as a .zip');
+  }
+
+  async function offerDroppedFolder(dirEntry) {
+    const out = [];
+    async function walk(dir, prefix) {
+      const reader = dir.createReader();
+      for (;;) {
+        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batch.length) break;
+        for (const en of batch) {
+          if (out.length > MAX_FOLDER_FILES) return;
+          if (en.isDirectory) await walk(en, prefix + en.name + '/');
+          else if (en.isFile) out.push({ file: await new Promise((res, rej) => en.file(res, rej)), path: prefix + en.name });
+        }
+      }
+    }
+    try {
+      await walk(dirEntry, dirEntry.name + '/');
+    } catch (_) {
+      return toast('Could not read the folder ' + dirEntry.name, 'error');
+    }
+    offerFolder(out, dirEntry.name);
+  }
+
+  /* ── Clipboard: send what you copied ─────────────────────── */
+  async function sendClipboard() {
+    try {
+      if (navigator.clipboard.read) {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const img = item.types.find(t => t.startsWith('image/'));
+          if (img) {
+            const blob = await item.getType(img);
+            offerFile(new File([blob], 'Copied image.' + (img.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, ''), { type: img }));
+            return;
+          }
+        }
+        for (const item of items) {
+          if (item.types.includes('text/plain')) {
+            const text = await (await item.getType('text/plain')).text();
+            return sendCopiedText(text);
+          }
+        }
+        return toast('Nothing copied yet — copy some text or a picture first');
+      }
+      sendCopiedText(await navigator.clipboard.readText());
+    } catch (_) {
+      toast('Could not read what you copied — paste it into the message box instead');
+      msgInput.focus();
+    }
+  }
+
+  function sendCopiedText(text) {
+    if (!text || !text.trim()) return toast('Nothing copied yet — copy some text or a picture first');
+    roomEmit('chat:message', { text: text.slice(0, 4000) });
+    toast('Sent what you copied — the others can tap Copy');
+  }
+
+  /* ── Screen sharing ────────────────────────────────────────────
+     Its own WebRTC connection per viewer, so it never disturbs the file
+     link. Needs a direct connection; there is no relay for video. */
+  let screenStream = null;
+  const screenLinks = new Map();   // viewer id -> RTCPeerConnection (we share)
+  const watching = new Map();      // sharer id -> { pc, panel, pending } (we watch)
+  const screenBar = $('screen-bar');
+  $('btn-screen-stop').addEventListener('click', stopScreenShare);
+
+  async function startScreenShare() {
+    if (screenStream) return;
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 30 } }, audio: true });
+    } catch (err) {
+      screenStream = null;
+      if (err && err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast('Could not share your screen', 'error');
+      return;
+    }
+    const video = screenStream.getVideoTracks()[0];
+    if (video) {
+      video.contentHint = 'detail';
+      video.addEventListener('ended', stopScreenShare);
+    }
+    screenBar.classList.remove('hidden');
+    const viewers = roomUsers.filter(u => u.id !== myId && !u.away);
+    viewers.forEach(u => shareScreenTo(u.id));
+    toast(viewers.length ? 'Sharing your screen with everyone here' : 'Sharing your screen — people who join will see it');
+    syncWakeLock();
+  }
+
+  function stopScreenShare() {
+    if (!screenStream) return;
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+    for (const [id, pc] of screenLinks) {
+      try { pc.close(); } catch (_) {}
+      try { socket.emit('rtc:signal', { to: id, payload: { type: 'scr-stop' } }); } catch (_) {}
+    }
+    screenLinks.clear();
+    screenBar.classList.add('hidden');
+  }
+
+  async function shareScreenTo(id) {
+    if (!screenStream || id === myId) return;
+    await rtcConfigReady;
+    const old = screenLinks.get(id);
+    if (old) { try { old.close(); } catch (_) {} }
+    const pc = new RTCPeerConnection(rtcConfig);
+    screenLinks.set(id, pc);
+    screenStream.getTracks().forEach(t => pc.addTrack(t, screenStream));
+    pc.onicecandidate = (e) => {
+      if (e.candidate) socket.emit('rtc:signal', { to: id, payload: { type: 'scr-ice', role: 's', candidate: e.candidate } });
+    };
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      socket.emit('rtc:signal', { to: id, payload: { type: 'scr-offer', sdp: pc.localDescription.sdp } });
+    } catch (err) {
+      console.warn('[halwa] screen offer failed', err);
+    }
+  }
+
+  function closeScreenFor(id) {
+    const link = screenLinks.get(id);
+    if (link) { try { link.close(); } catch (_) {} screenLinks.delete(id); }
+    const w = watching.get(id);
+    if (w) { try { w.pc.close(); } catch (_) {} w.panel.remove(); watching.delete(id); }
+  }
+
+  async function handleScreenSignal(from, payload) {
+    try {
+      if (payload.type === 'scr-offer') {
+        await rtcConfigReady;
+        closeScreenFor(from);
+        const pc = new RTCPeerConnection(rtcConfig);
+        const w = { pc, panel: screenPanel(from), pending: [] };
+        watching.set(from, w);
+        pc.ontrack = (e) => {
+          const v = w.panel.querySelector('video');
+          if (v.srcObject !== e.streams[0]) v.srcObject = e.streams[0];
+        };
+        pc.onicecandidate = (e) => {
+          if (e.candidate) socket.emit('rtc:signal', { to: from, payload: { type: 'scr-ice', role: 'v', candidate: e.candidate } });
+        };
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') {
+            w.panel.querySelector('.screen-note').textContent = 'Could not connect directly to show this screen. Try the same Wi-Fi.';
+          }
+        };
+        await pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
+        await pc.setLocalDescription(await pc.createAnswer());
+        socket.emit('rtc:signal', { to: from, payload: { type: 'scr-answer', sdp: pc.localDescription.sdp } });
+        for (const c of w.pending.splice(0)) { try { await pc.addIceCandidate(c); } catch (_) {} }
+      } else if (payload.type === 'scr-answer') {
+        const pc = screenLinks.get(from);
+        if (pc && pc.signalingState === 'have-local-offer') await pc.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
+      } else if (payload.type === 'scr-ice') {
+        // 's' came from a sharer, for our viewing side; 'v' from a viewer.
+        const pc = payload.role === 's' ? (watching.get(from) || {}).pc : screenLinks.get(from);
+        if (!pc) return;
+        if (pc.remoteDescription) { try { await pc.addIceCandidate(payload.candidate); } catch (_) {} }
+        else if (payload.role === 's' && watching.get(from)) watching.get(from).pending.push(payload.candidate);
+      } else if (payload.type === 'scr-stop') {
+        const w = watching.get(from);
+        if (w) { try { w.pc.close(); } catch (_) {} w.panel.remove(); watching.delete(from); }
+      }
+    } catch (err) {
+      console.warn('[halwa] screen signalling error', err);
+    }
+  }
+
+  function screenPanel(from) {
+    const user = roomUsers.find(u => u.id === from);
+    const panel = document.createElement('div');
+    panel.className = 'screen-panel';
+    const head = document.createElement('div');
+    head.className = 'screen-head';
+    const title = document.createElement('span');
+    title.textContent = '🖥️ ' + (user ? user.label : 'Someone') + "'s screen";
+    const sound = document.createElement('button');
+    sound.type = 'button'; sound.className = 'icon-btn'; sound.textContent = '🔇'; sound.title = 'Turn sound on';
+    const full = document.createElement('button');
+    full.type = 'button'; full.className = 'icon-btn'; full.textContent = '⛶'; full.title = 'Full screen';
+    const small = document.createElement('button');
+    small.type = 'button'; small.className = 'icon-btn'; small.textContent = '–'; small.title = 'Make smaller';
+    head.append(title, sound, full, small);
+    const video = document.createElement('video');
+    video.autoplay = true; video.playsInline = true; video.muted = true;
+    const note = document.createElement('p');
+    note.className = 'screen-note';
+    panel.append(head, video, note);
+    document.querySelector('.chat-area').appendChild(panel);
+    sound.addEventListener('click', () => {
+      video.muted = !video.muted;
+      sound.textContent = video.muted ? '🔇' : '🔊';
+      sound.title = video.muted ? 'Turn sound on' : 'Mute';
+    });
+    full.addEventListener('click', () => {
+      const el = video;
+      if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+      else if (el.webkitEnterFullscreen) el.webkitEnterFullscreen();
+    });
+    small.addEventListener('click', () => panel.classList.toggle('mini'));
+    return panel;
+  }
+
+  /* ── From the browser extension ──────────────────────────────── */
+  const extQueue = [];
+  onExtensionItem((item) => {
+    if (!joined) { extQueue.push(item); return; }
+    takeExtItem(item);
+  });
+  function takeExtItem({ text, files }) {
+    if (text) { msgInput.value = text; msgInput.focus(); }
+    if (files.length) confirmShared(files);
+  }
+  const extTimer = setInterval(() => {
+    if (!joined) return;
+    clearInterval(extTimer);
+    extQueue.splice(0).forEach(takeExtItem);
+  }, 300);
+
+  /* ── Install on this device ──────────────────────────────────── */
+  const btnInstallRoom = $('btn-install-room');
+  let installPromptRoom = null;
+  if (!isStandalone()) {
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      installPromptRoom = e;
+      btnInstallRoom.classList.remove('hidden');
+    });
+  }
+  btnInstallRoom.addEventListener('click', async () => {
+    if (!installPromptRoom) return;
+    installPromptRoom.prompt();
+    await installPromptRoom.userChoice.catch(() => {});
+    installPromptRoom = null;
+    btnInstallRoom.classList.add('hidden');
+  });
+
   window.addEventListener('beforeunload', (e) => {
     const busy = isTransferring();
     if (busy) {
@@ -2502,5 +3320,6 @@ if (isRoomPage) {
     }
     objectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (_) {} });
     peers.forEach(p => p.close());
+    if (screenStream) stopScreenShare();
   });
 }
