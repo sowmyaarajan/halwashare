@@ -622,6 +622,30 @@ io.on('connection', (socket) => {
     io.to(code).emit('room:users', userList(room));
   });
 
+  /* Change the name others see. Unique within the room; old messages keep
+     the name they were sent under, and the room is told who is who. */
+  on('room:rename', (arg, cb) => {
+    const reply = typeof cb === 'function' ? cb : () => {};
+    const { code, pid } = socket.data;
+    const room = code && rooms[code];
+    const member = room && room.users.find(u => u.pid === pid && u.sid === socket.id);
+    if (!member) return reply({ error: 'You are not in a room.' });
+    if (!allow('presence')) return reply({ error: SLOW_DOWN });
+    const wanted = cleanName(arg && arg.name);
+    if (!wanted) return reply({ error: 'Pick a name with at least one letter or number.' });
+    const label = assignLabel({ users: room.users.filter(u => u !== member) }, wanted);
+    if (!label) return reply({ error: 'That name is taken.' });
+    if (label === member.label) return reply({ label });
+    const old = member.label;
+    member.label = label;
+    socket.data.label = label;
+    const sys = { type: 'system', text: old + ' is now ' + label, ts: Date.now() };
+    pushHistory(room, sys);
+    io.to(code).emit('chat:message', sys);
+    io.to(code).emit('room:users', userList(room));
+    reply({ label });
+  });
+
   /* Leaving on purpose: no grace period. */
   on('room:leave', () => {
     const { code, pid } = socket.data;

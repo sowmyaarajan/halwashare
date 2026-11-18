@@ -1134,10 +1134,13 @@ if (isRoomPage) {
         '<span class="mode-pill mode-' + mode + '">' + modeLabel(mode) + '</span>';
       const lock = !self && peer && peer.safety && peer.linkAlive()
         ? '<span class="safety-badge" title="Verified link available — tap to compare the safety code">🔐</span>' : '';
-      return '<li class="user-item' + (u.away ? ' away' : '') + (self ? '' : ' tappable') + '"' +
-        (self ? '' : ' data-id="' + escapeHtml(u.id) + '" tabindex="0" role="button" title="Safety code with ' + escapeHtml(u.label) + '"') + '>' +
+      if (peer) peer.label = u.label;   // follow renames
+      return '<li class="user-item tappable' + (u.away ? ' away' : '') + '"' +
+        (self
+          ? ' data-self="1" tabindex="0" role="button" title="Tap to change your name"'
+          : ' data-id="' + escapeHtml(u.id) + '" tabindex="0" role="button" title="Safety code with ' + escapeHtml(u.label) + '"') + '>' +
         '<span class="avatar">' + escapeHtml(avatarText(u.label)) + '</span>' +
-        '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you)' : u.away ? ' · reconnecting…' : '') + '</span>' +
+        '<span class="user-name">' + escapeHtml(u.label) + (self ? ' (you) ✏️' : u.away ? ' · reconnecting…' : '') + '</span>' +
         lock + badge +
       '</li>';
     }).join('');
@@ -1148,11 +1151,29 @@ if (isRoomPage) {
   }
 
   userListEl.addEventListener('click', (e) => {
+    if (e.target.closest('.user-item[data-self]')) return renameSelf();
     const item = e.target.closest('.user-item[data-id]');
     if (item) showSafety(item.dataset.id);
   });
+
+  /* Your name here is also this device's name everywhere else. */
+  function renameSelf() {
+    const name = window.prompt('Your name — everyone in the room sees it:', myLabel || getDevice().name);
+    if (name === null) return;
+    const clean = cleanDeviceName(name);
+    if (!clean) return toast('Pick a name with at least one letter or number', 'error');
+    if (!inRoom) return toast('Reconnecting — try again in a moment');
+    socket.emit('room:rename', { name: clean }, (res) => {
+      if (!res || res.error) return toast((res && res.error) || 'Could not change your name', 'error');
+      myLabel = res.label;
+      renameDevice(clean);
+      presence.hello();
+      if (res.label !== clean) toast('Someone here is already ' + clean + ' — you are ' + res.label);
+    });
+  }
   userListEl.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.target.closest('.user-item[data-self]')) { e.preventDefault(); return renameSelf(); }
     const item = e.target.closest('.user-item[data-id]');
     if (item) { e.preventDefault(); showSafety(item.dataset.id); }
   });

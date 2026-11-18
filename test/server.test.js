@@ -564,6 +564,27 @@ test('an invite into an existing room only works from inside that room', async (
   assert.equal((await invited).code, code);
 });
 
+test('people can rename themselves; names stay unique and the room is told', async () => {
+  const { a, b, code } = await pair();
+  const told = next(b, 'chat:message');
+  const users = next(b, 'room:users');
+  const r = await call(a, 'room:rename', { name: '  Sowmya ' });
+  assert.equal(r.label, 'Sowmya');
+  assert.match((await told).text, / is now Sowmya$/);
+  assert.ok((await users).some(u => u.label === 'Sowmya'));
+  // b asks for the same name and gets it made unique.
+  assert.equal((await call(b, 'room:rename', { name: 'Sowmya' })).label, 'Sowmya 2');
+  assert.ok((await call(b, 'room:rename', { name: '   ' })).error);
+  // Messages now carry the new name.
+  const msg = next(b, 'chat:message');
+  a.emit('chat:message', { text: 'hi' });
+  assert.equal((await msg).sender, 'Sowmya');
+  // Not in a room: refused.
+  const c = await connected(client());
+  assert.ok((await call(c, 'room:rename', { name: 'X' })).error);
+  assert.ok(rooms[code]);
+});
+
 test('device names become room labels, kept unique', async () => {
   const a = await connected(client());
   const b = await connected(client());
