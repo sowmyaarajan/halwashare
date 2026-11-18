@@ -501,6 +501,21 @@ test('devices on the same network see each other; others do not', async () => {
   assert.ok(r2.error);
 });
 
+test('a hidden device is not listed nearby and cannot be invited by id', async () => {
+  const ip = '10.7.5.1';
+  const a = await connected(client({ ip }));
+  const h = await connected(client({ ip }));
+  hello(a, 'Visible', 'devJjjjjjjjjjjjjjjj');
+  await sleep(50);
+  const own = next(h, 'presence:nearby');
+  h.emit('presence:hello', { name: 'Hidden', kind: 'phone', device: 'devKkkkkkkkkkkkkkkk', visible: false });
+  assert.deepEqual(await own, []);              // sees nobody
+  await silent(a, 'presence:nearby', 200);     // and nobody is told about it
+  const again = next(a, 'presence:nearby');
+  hello(a, 'Visible', 'devJjjjjjjjjjjjjjjj');
+  assert.deepEqual(await again, []);
+});
+
 test('paired devices find each other by token, and only the token holder can invite', async () => {
   const a = await connected(client({ ip: '10.7.2.1' }));
   const b = await connected(client({ ip: '10.7.3.1' }));   // different networks

@@ -283,6 +283,11 @@ function removePaired(token) {
   savePaired(getPaired().filter(p => p.token !== token));
 }
 
+/* Whether other devices on this network may see this one. */
+function isVisibleNearby() {
+  try { return localStorage.getItem('halwa-visible') !== '0'; } catch (_) { return true; }
+}
+
 function kindIcon(kind) {
   return kind === 'phone' || kind === 'tablet' ? '📱' : kind === 'desktop' ? '🖥️' : '💻';
 }
@@ -309,7 +314,7 @@ function startPresence(socket, on) {
     const d = getDevice();
     socket.emit('presence:hello', {
       name: d.name, kind: d.kind, device: d.id, clientId: getClientId(),
-      tokens: getPaired().map(p => p.token),
+      tokens: getPaired().map(p => p.token), visible: isVisibleNearby(),
     });
   }
   socket.on('connect', hello);
@@ -650,6 +655,20 @@ if (!isRoomPage) {
     clearTimeout(inviteTimer);
     inviteTimer = setTimeout(close, 60000);
   }
+
+  const btnVisible = document.getElementById('btn-visible');
+  const paintVisible = () => {
+    btnVisible.textContent = isVisibleNearby() ? 'Hide me from nearby' : 'Show me to nearby devices';
+    document.getElementById('nearby-empty').textContent = isVisibleNearby()
+      ? 'Open HalwaShare on another device on this Wi-Fi and it appears here.'
+      : 'Hidden — other devices on this network cannot see this one, and it does not see them. Remembered devices still work.';
+  };
+  paintVisible();
+  btnVisible.addEventListener('click', () => {
+    try { localStorage.setItem('halwa-visible', isVisibleNearby() ? '0' : '1'); } catch (_) {}
+    paintVisible();
+    presence.hello();
+  });
 
   document.getElementById('btn-rename').addEventListener('click', () => {
     const name = window.prompt('Name this device — others see it in rooms and nearby lists:', getDevice().name);

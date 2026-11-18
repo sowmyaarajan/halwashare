@@ -651,9 +651,12 @@ io.on('connection', (socket) => {
       tokens: new Set(tokens),
       at: Date.now(),
     };
-    addTo(nets, ip, socket);
+    // A device that chose to hide is neither listed nor shown the list;
+    // its remembered devices still find it.
+    if (arg.visible === false) socket.emit('presence:nearby', []);
+    else addTo(nets, ip, socket);
     for (const t of tokens) addTo(pairTokens, t, socket);
-    announceNearby(ip);
+    if (arg.visible !== false) announceNearby(ip);
     for (const t of tokens) announcePaired(t);
   });
 
