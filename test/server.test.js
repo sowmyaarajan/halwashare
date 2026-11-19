@@ -13,7 +13,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { io: connect } = require('socket.io-client');
 const WebSocket = require('ws');
-const { start, server, io, rooms, CODE_LENGTH, targetBacklog } = require('../server');
+const { start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory } = require('../server');
 
 let base;
 let ipSeq = 0;
@@ -84,11 +84,12 @@ test('creates ' + CODE_LENGTH + '-digit codes and lets a second device join', as
   assert.equal(j.label, 'User 1');
 });
 
-test('chat reaches the other person', async () => {
-  const { a, b } = await pair();
-  const got = next(b, 'chat:message');
+test('the server does not carry or keep chat', async () => {
+  const { a, b, code } = await pair();
+  const quiet = silent(b, 'chat:message', 300);
   a.emit('chat:message', { text: 'hello' });
-  assert.equal((await got).text, 'hello');
+  await quiet;
+  assert.equal(rooms[code].history.filter(h => h.type === 'chat').length, 0);
 });
 
 test('rejects malformed codes and ids', async () => {
@@ -302,14 +303,9 @@ test('file offers need real types', async () => {
   assert.equal(rooms[code].history.filter(h => h.type === 'file').length, 0);
 });
 
-test('chat history is capped by bytes', async () => {
-  const { a, code } = await pair();
-  for (let i = 0; i < 60; i++) {
-    a.emit('chat:message', { text: 'x'.repeat(4000) });
-    if (i % 15 === 14) await sleep(1000); // stay under the chat rate limit
-  }
-  await sleep(200);
-  const room = rooms[code];
+test('room history is capped by bytes', () => {
+  const room = { history: [], historyBytes: 0 };
+  for (let i = 0; i < 60; i++) pushHistory(room, { type: 'system', text: 'x'.repeat(4000), ts: i });
   assert.ok(room.historyBytes <= 128 * 1024 + 5000, 'history holds ' + room.historyBytes + ' bytes');
   assert.ok(room.history.length < 60);
 });
@@ -404,8 +400,8 @@ test('a dropped connection is "away", not gone, and coming back keeps everything
   assert.ok(!jb2.history.some(h => h.type === 'system' && /left/.test(h.text)));
 
   // Messages reach the person on their new connection.
-  const got = next(b2, 'msg:ack');
-  a2.emit('msg:ack', { id: 'm1', to: jb.selfId });
+  const got = next(b2, 'relay:ctrl');
+  a2.emit('relay:ctrl', { to: jb.selfId, msg: { t: 'chat-ack', id: 'm1aaaaaaa' } });
   assert.equal((await got).from, ja.selfId);
 });
 
@@ -575,10 +571,6 @@ test('people can rename themselves; names stay unique and the room is told', asy
   // b asks for the same name and gets it made unique.
   assert.equal((await call(b, 'room:rename', { name: 'Sowmya' })).label, 'Sowmya 2');
   assert.ok((await call(b, 'room:rename', { name: '   ' })).error);
-  // Messages now carry the new name.
-  const msg = next(b, 'chat:message');
-  a.emit('chat:message', { text: 'hi' });
-  assert.equal((await msg).sender, 'Sowmya');
   // Not in a room: refused.
   const c = await connected(client());
   assert.ok((await call(c, 'room:rename', { name: 'X' })).error);

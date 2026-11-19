@@ -969,6 +969,7 @@ if (isRoomPage) {
       if (first) {
         loadQR(urlCode);
         res.history.forEach(renderHistoryEntry);
+        restoreChat();
         showCapabilityNote();
         offerSharedFiles();
       } else {
@@ -1015,9 +1016,7 @@ if (isRoomPage) {
         const card = cards.get(h.fileId);
         if (!card) { if (h.ownerId !== myId) renderHistoryEntry(h); }
         else if (!card.mine) setAvailability(card, h.available);
-      } else if (h.type === 'chat') {
-        if (!seenChat.has(h.id)) renderChat(h);
-      } else if (h.ts > since) {
+      } else if (h.ts > since && h.type === 'system') {
         renderSystem(h);
       }
     }
@@ -1294,6 +1293,10 @@ if (isRoomPage) {
         });
       }
       clearTimeout(this.graceTimer);
+      // A link that just came up: hand them the chat they missed.
+      if ((mode === 'p2p' || mode === 'relay') && prev !== 'p2p' && prev !== 'relay') {
+        setTimeout(() => syncChatTo(this), 0);
+      }
       const waiters = this.openWaiters;
       this.openWaiters = [];
       if (mode === 'dead') {
@@ -1710,6 +1713,27 @@ if (isRoomPage) {
 
       case 'ack':                    // relay flow control
         peer.creditRelay(msg.bytes || 0);
+        break;
+
+      case 'chat':                   // a message, straight from its author
+        receiveChat(peer, msg, false);
+        break;
+
+      case 'chat-sync':              // their own earlier messages, for us
+        if (Array.isArray(msg.list)) msg.list.slice(-CHAT_MAX).forEach(m => receiveChat(peer, m, true));
+        if (Array.isArray(msg.reacts)) {
+          msg.reacts.slice(0, 2000).forEach(r => Array.isArray(r) && applyReact(peer.id, r[0], r[1], true));
+        }
+        break;
+
+      case 'chat-ack': {             // they have our message
+        const r = typeof msg.id === 'string' && receipts.get(msg.id);
+        if (r) { r.acked.add(peer.label); markReceipt(msg.id); }
+        break;
+      }
+
+      case 'react':
+        applyReact(peer.id, msg.key, msg.emoji, msg.on !== false);
         break;
 
       case 'pair-req':               // they want to remember this device
@@ -2274,7 +2298,6 @@ if (isRoomPage) {
   /* ── Message rendering ───────────────────────────────────── */
   function renderHistoryEntry(entry) {
     if (entry.type === 'system') return renderSystem(entry);
-    if (entry.type === 'chat') return renderChat(entry);
     if (entry.type === 'file') {
       if (entry.ownerId === myId) {
         // Ours, from before this page was reloaded: the browser no longer
@@ -2297,15 +2320,27 @@ if (isRoomPage) {
     }
   }
 
-  function rowFor(sender, ts, mine) {
+  function rowFor(sender, ts, mine, inOrder) {
     const row = document.createElement('div');
     row.className = 'msg-row ' + (mine ? 'self' : 'other');
+    row.dataset.ts = String(ts || Date.now());
     const meta = document.createElement('div');
     meta.className = 'msg-meta';
     meta.textContent = (mine ? 'You' : sender) + ' · ' + formatTime(ts);
     row.appendChild(meta);
-    messagesEl.appendChild(row);
+    placeByTime(row, inOrder);
     return row;
+  }
+
+  /* New things go at the bottom; earlier messages handed over by someone
+     go where they belong in time. */
+  function placeByTime(el, inOrder) {
+    if (inOrder) {
+      const ts = Number(el.dataset.ts);
+      const after = [...messagesEl.children].find(c => c.dataset.ts && Number(c.dataset.ts) > ts);
+      if (after) { messagesEl.insertBefore(el, after); return; }
+    }
+    messagesEl.appendChild(el);
   }
 
   let lastSeenTs = 0;            // newest message on screen, for catching up
@@ -2315,27 +2350,34 @@ if (isRoomPage) {
     lastSeenTs = Math.max(lastSeenTs, msg.ts || 0);
     const el = document.createElement('div');
     el.className = 'msg-system';
+    el.dataset.ts = String(msg.ts || Date.now());
     el.textContent = msg.text;
     messagesEl.appendChild(el);
     scrollToBottom();
   }
 
-  function renderChat(msg) {
-    if (msg.id) {
-      if (seenChat.has(msg.id)) return;
-      seenChat.add(msg.id);
-    }
+  /* msg: { key, id, senderId, sender, text, ts, reply }. `opts.inOrder`
+     places it by time; `opts.restored` is a message this page already
+     showed before a refresh, so no receipts are asked for again. */
+  function renderChat(msg, opts) {
+    const o = opts || {};
+    if (seenChat.has(msg.key)) return;
+    seenChat.add(msg.key);
     lastSeenTs = Math.max(lastSeenTs, msg.ts || 0);
-    const mine = msg.senderId ? msg.senderId === myId : msg.sender === myLabel;
-    const row = rowFor(msg.sender, msg.ts, mine);
+    const mine = msg.senderId === myId;
+    const row = rowFor(msg.sender, msg.ts, mine, o.inOrder);
+    row.dataset.key = msg.key;
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.innerHTML = linkify(msg.text);
+    if (msg.reply) bubble.appendChild(quoteFor(msg.reply));
+    const body = document.createElement('span');
+    body.innerHTML = linkify(msg.text);
+    bubble.appendChild(body);
     row.appendChild(bubble);
 
-    if (mine && msg.id) {
-      // One tick: the server has it. Two: everyone in the room has it.
+    if (mine && !o.restored) {
+      // One tick: sent. Two: the others have it.
       const ticks = document.createElement('span');
       ticks.className = 'ticks';
       ticks.textContent = '✓';
@@ -2347,22 +2389,72 @@ if (isRoomPage) {
         expected: Math.max(0, roomUsers.length - 1),
       });
       markReceipt(msg.id);
-    } else if (!mine && msg.id && msg.senderId) {
-      socket.emit('msg:ack', { id: msg.id, to: msg.senderId });
     }
 
-    const copy = document.createElement('button');
-    copy.className = 'copy-btn';
-    copy.type = 'button';
-    copy.title = 'Copy text';
-    copy.textContent = 'Copy';
-    copy.addEventListener('click', () => {
+    const chips = document.createElement('div');
+    chips.className = 'reacts';
+    row.appendChild(chips);
+
+    const tools = document.createElement('div');
+    tools.className = 'msg-tools';
+    const tool = (label, title, fn) => {
+      const b = document.createElement('button');
+      b.className = 'copy-btn';
+      b.type = 'button';
+      b.title = title;
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); fn(b); });
+      tools.appendChild(b);
+      return b;
+    };
+    tool('Reply', 'Reply to this message', () => startReply(msg));
+    tool('☺+', 'React', (b) => openReactPicker(msg.key, b));
+    tool('Copy', 'Copy text', (b) => {
       copyText(msg.text);
-      copy.textContent = 'Copied';
-      setTimeout(() => { copy.textContent = 'Copy'; }, 1400);
+      b.textContent = 'Copied';
+      setTimeout(() => { b.textContent = 'Copy'; }, 1400);
     });
-    row.appendChild(copy);
+    row.appendChild(tools);
+    paintReacts(msg.key);
     scrollToBottom();
+  }
+
+  /* The message being replied to, shown inside the reply. Looked up here
+     by its key, so nobody can put words in someone else's mouth. */
+  function quoteFor(key) {
+    const q = document.createElement('button');
+    q.type = 'button';
+    q.className = 'quote';
+    q.dataset.reply = key;
+    fillQuote(q);
+    q.addEventListener('click', () => {
+      const el = messagesEl.querySelector('[data-key="' + CSS.escape(key) + '"]');
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 1200);
+    });
+    return q;
+  }
+
+  function fillQuote(q) {
+    const target = chatLog.find(m => m.key === q.dataset.reply);
+    const who = document.createElement('strong');
+    who.textContent = target ? (target.senderId === myId ? 'You' : target.sender) : 'Earlier message';
+    const what = document.createElement('span');
+    what.textContent = target ? snippet(target.text) : 'not on this device';
+    q.replaceChildren(who, what);
+  }
+
+  /* A reply can arrive before the message it answers (someone joining
+     late gets each person's messages separately): fill it in then. */
+  function refreshQuotes(key) {
+    messagesEl.querySelectorAll('.quote[data-reply="' + CSS.escape(key) + '"]').forEach(fillQuote);
+  }
+
+  function snippet(text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    return t.length > 90 ? t.slice(0, 89) + '…' : t;
   }
 
   function renderFileCard(meta, mine) {
@@ -2504,27 +2596,244 @@ if (isRoomPage) {
   function sendMessage() {
     const text = msgInput.value;
     if (!text.trim()) return;
-    roomEmit('chat:message', { text });
+    if (!sendChat(text)) return;
     if (inRoom) socket.emit('chat:typing', false);
     msgInput.value = '';
     msgInput.focus();
   }
 
+  /* Only the server's own notes ("X joined") still come from the server. */
   socket.on('chat:message', (msg) => {
-    if (msg.type === 'system') renderSystem(msg);
-    else {
-      renderChat(msg);
-      const mine = msg.senderId ? msg.senderId === myId : msg.sender === myLabel;
-      if (!mine) { playPing(); noteArrival(msg.sender, msg.text); }
-    }
-    updateEmptyState();
+    if (msg && msg.type === 'system') { renderSystem(msg); updateEmptyState(); }
   });
 
-  socket.on('msg:ack', ({ id, label }) => {
-    const r = receipts.get(id);
-    if (!r) return;
-    r.acked.add(label);
-    markReceipt(id);
+  /* ── Chat, peer to peer ──────────────────────────────────────
+     Messages go from the writer straight to each person over the same
+     link the files use, so the server never sees them. (When no direct
+     link can be made, they ride the relay, as files do.) Nobody else
+     holds the history, so:
+       · each page keeps this room's chat for itself (sessionStorage),
+         so a refresh loses nothing
+       · when a link comes up, each side hands over the messages it wrote
+         itself — someone arriving late sees what the people here said,
+         and every message's author is the person whose link carried it. */
+  const CHAT_MAX = 300;
+  const CHAT_KEY = 'halwa-chat-' + urlCode;
+  const REACTIONS = ['👍', '❤️', '😂', '😮', '🙏', '✅'];
+  const MSG_ID_RE = /^[A-Za-z0-9_-]{8,40}$/;
+  let chatLog = [];                    // { key, id, senderId, sender, text, ts, reply }
+  const reactions = new Map();         // key -> Map(emoji -> Set(pid))
+  let replyTo = null;
+
+  function chatId() {
+    return b64url(crypto.getRandomValues(new Uint8Array(12)));
+  }
+
+  function saveChat() {
+    try {
+      const reacts = [];
+      for (const [key, m] of reactions) for (const [emoji, who] of m) for (const pid of who) reacts.push([key, emoji, pid]);
+      sessionStorage.setItem(CHAT_KEY, JSON.stringify({ log: chatLog.slice(-CHAT_MAX), reacts: reacts.slice(-3000) }));
+    } catch (_) {}
+  }
+
+  /* After a refresh: what this page had already shown. */
+  function restoreChat() {
+    let saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(CHAT_KEY) || 'null'); } catch (_) {}
+    if (!saved || !Array.isArray(saved.log)) return;
+    for (const r of Array.isArray(saved.reacts) ? saved.reacts : []) {
+      if (Array.isArray(r) && typeof r[2] === 'string') setReact(r[2], r[0], r[1], true);
+    }
+    for (const m of saved.log) {
+      if (!m || typeof m.key !== 'string' || typeof m.text !== 'string' || seenChat.has(m.key)) continue;
+      addToLog(m);
+      renderChat(m, { inOrder: true, restored: true });
+    }
+    updateEmptyState();
+  }
+
+  function addToLog(m) {
+    let i = chatLog.length;
+    while (i > 0 && chatLog[i - 1].ts > m.ts) i--;
+    chatLog.splice(i, 0, m);
+    if (chatLog.length > CHAT_MAX) chatLog.splice(0, chatLog.length - CHAT_MAX);
+  }
+
+  function sendChat(text) {
+    const clean = String(text).slice(0, 4000);
+    if (!clean.trim()) return false;
+    if (!myId) { toast('Still connecting — try again in a moment'); return false; }
+    const id = chatId();
+    const msg = { key: myId + '/' + id, id, senderId: myId, sender: myLabel, text: clean, ts: Date.now() };
+    if (replyTo) msg.reply = replyTo.key;
+    clearReply();
+    addToLog(msg);
+    saveChat();
+    renderChat(msg);
+    updateEmptyState();
+    for (const peer of peers.values()) {
+      peer.ready().then(() => peer.sendCtrl({ t: 'chat', id, text: clean, ts: msg.ts, reply: msg.reply }))
+        .catch(() => {});   // gone; they get it from the sync if they come back
+    }
+    return true;
+  }
+
+  function receiveChat(peer, m, synced) {
+    if (!m || typeof m.id !== 'string' || !MSG_ID_RE.test(m.id)) return;
+    if (typeof m.text !== 'string' || !m.text.trim()) return;
+    const key = peer.id + '/' + m.id;            // the link says who wrote it
+    if (seenChat.has(key)) {
+      if (!synced) { try { peer.sendCtrl({ t: 'chat-ack', id: m.id }); } catch (_) {} }
+      return;
+    }
+    const now = Date.now();
+    const ts = Number.isFinite(m.ts) && m.ts < now + 60000 && m.ts > now - 7 * 864e5 ? m.ts : now;
+    const msg = { key, id: m.id, senderId: peer.id, sender: peer.label, text: m.text.slice(0, 4000), ts };
+    if (typeof m.reply === 'string' && m.reply.length <= 120) msg.reply = m.reply;
+    addToLog(msg);
+    saveChat();
+    renderChat(msg, { inOrder: synced });
+    refreshQuotes(key);
+    updateEmptyState();
+    try { peer.sendCtrl({ t: 'chat-ack', id: m.id }); } catch (_) {}
+    if (!synced) { playPing(); noteArrival(msg.sender, msg.text); }
+  }
+
+  /* Our own messages and reactions, for someone whose link just came up.
+     Sent in parts: a data channel message has a size limit. */
+  function syncChatTo(peer) {
+    if (!myId || peer.closed) return;
+    const mine = chatLog.filter(m => m.senderId === myId).slice(-150)
+      .map(m => ({ id: m.id, text: m.text, ts: m.ts, reply: m.reply }));
+    const reacts = [];
+    for (const [key, m] of reactions) for (const [emoji, who] of m) if (who.has(myId)) reacts.push([key, emoji]);
+    if (!mine.length && !reacts.length) return;
+    let part = [];
+    let size = 0;
+    const flush = (withReacts) => {
+      try { peer.sendCtrl({ t: 'chat-sync', list: part, reacts: withReacts ? reacts : [] }); } catch (_) {}
+      part = []; size = 0;
+    };
+    for (const m of mine) {
+      const n = m.text.length * 3 + 120;
+      if (size + n > 48 * 1024 && part.length) flush(false);
+      part.push(m); size += n;
+    }
+    flush(true);
+  }
+
+  /* ── Replies ── */
+  const replyBar = document.createElement('div');
+  replyBar.className = 'reply-bar hidden';
+  document.querySelector('.composer').before(replyBar);
+
+  function startReply(msg) {
+    replyTo = msg;
+    replyBar.replaceChildren();
+    const t = document.createElement('span');
+    t.className = 'reply-bar-text';
+    const who = document.createElement('strong');
+    who.textContent = 'Replying to ' + (msg.senderId === myId ? 'yourself' : msg.sender);
+    const what = document.createElement('span');
+    what.textContent = snippet(msg.text);
+    t.append(who, what);
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'reply-bar-close';
+    x.setAttribute('aria-label', 'Cancel reply');
+    x.textContent = '✕';
+    x.addEventListener('click', clearReply);
+    replyBar.append(t, x);
+    replyBar.classList.remove('hidden');
+    msgInput.focus();
+  }
+
+  function clearReply() {
+    replyTo = null;
+    replyBar.classList.add('hidden');
+    replyBar.replaceChildren();
+  }
+  msgInput.addEventListener('keydown', (e) => { if (e.key === 'Escape' && replyTo) clearReply(); });
+
+  /* ── Reactions ── */
+  function setReact(pid, key, emoji, on) {
+    if (typeof key !== 'string' || key.length > 120 || !REACTIONS.includes(emoji)) return false;
+    let m = reactions.get(key);
+    if (!m) { if (!on) return false; m = new Map(); reactions.set(key, m); }
+    let who = m.get(emoji);
+    if (!who) { if (!on) return false; who = new Set(); m.set(emoji, who); }
+    if (on) who.add(pid); else who.delete(pid);
+    if (!who.size) m.delete(emoji);
+    if (!m.size) reactions.delete(key);
+    return true;
+  }
+
+  function applyReact(pid, key, emoji, on) {
+    if (reactions.size > 3000 && !reactions.has(key)) return;
+    if (!setReact(pid, key, emoji, on)) return;
+    saveChat();
+    paintReacts(key);
+  }
+
+  function toggleReact(key, emoji) {
+    const m = reactions.get(key);
+    const on = !(m && m.get(emoji) && m.get(emoji).has(myId));
+    applyReact(myId, key, emoji, on);
+    for (const peer of peers.values()) {
+      peer.ready().then(() => peer.sendCtrl({ t: 'react', key, emoji, on })).catch(() => {});
+    }
+  }
+
+  function nameOf(pid) {
+    if (pid === myId) return 'You';
+    const u = roomUsers.find(x => x.id === pid);
+    return u ? u.label : 'Someone who left';
+  }
+
+  function paintReacts(key) {
+    const row = messagesEl.querySelector('[data-key="' + CSS.escape(key) + '"]');
+    const box = row && row.querySelector('.reacts');
+    if (!box) return;
+    box.replaceChildren();
+    const m = reactions.get(key);
+    if (!m) return;
+    for (const emoji of REACTIONS) {
+      const who = m.get(emoji);
+      if (!who || !who.size) continue;
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'react-chip' + (who.has(myId) ? ' mine' : '');
+      chip.textContent = emoji + (who.size > 1 ? ' ' + who.size : '');
+      chip.title = [...who].map(nameOf).join(', ');
+      chip.addEventListener('click', () => toggleReact(key, emoji));
+      box.appendChild(chip);
+    }
+  }
+
+  let openPicker = null;
+  function openReactPicker(key, anchor) {
+    if (openPicker) openPicker.remove();
+    const pick = document.createElement('div');
+    pick.className = 'react-picker';
+    pick.setAttribute('role', 'menu');
+    for (const emoji of REACTIONS) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.textContent = emoji;
+      b.addEventListener('click', (e) => { e.stopPropagation(); toggleReact(key, emoji); pick.remove(); openPicker = null; });
+      pick.appendChild(b);
+    }
+    anchor.closest('.msg-row').appendChild(pick);
+    openPicker = pick;
+    pick.querySelector('button').focus();
+  }
+  document.addEventListener('click', (e) => {
+    if (openPicker && !openPicker.contains(e.target)) { openPicker.remove(); openPicker = null; }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && openPicker) { openPicker.remove(); openPicker = null; }
   });
 
   function markReceipt(id) {
@@ -3229,8 +3538,7 @@ if (isRoomPage) {
 
   function sendCopiedText(text) {
     if (!text || !text.trim()) return toast('Nothing copied yet — copy some text or a picture first');
-    roomEmit('chat:message', { text: text.slice(0, 4000) });
-    toast('Sent what you copied — the others can tap Copy');
+    if (sendChat(text)) toast('Sent what you copied — the others can tap Copy');
   }
 
   /* ── Screen sharing ────────────────────────────────────────────

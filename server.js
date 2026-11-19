@@ -202,7 +202,6 @@ const globalMisses = new Bucket(
 const LIMITS = {
   create:  [1 / 6, 10],          // ~10 rooms a minute per IP
   lookup:  [1 / 3, 15],          // failed code lookups per IP — the guessing guard
-  chat:    [3, 20],
   typing:  [4, 10],
   signal:  [50, 400],            // ICE candidates arrive in bursts
   ctrl:    [100, 400],
@@ -870,35 +869,10 @@ io.on('connection', (socket) => {
 
   on('disconnect', () => clearTimeout(relayTimer));
 
-  /* ── Chat ───────────────────────────────────────────────── */
-  on('chat:message', (arg) => {
-    const { code, label } = socket.data;
-    if (!code || !rooms[code]) return;
-    const text = arg && arg.text;
-    if (typeof text !== 'string') return;
-    const clean = text.slice(0, 4000);
-    if (!clean.trim() || !allow('chat')) return;
-    const msg = {
-      type: 'chat',
-      id: Math.random().toString(36).slice(2) + Date.now().toString(36),
-      sender: label,
-      senderId: socket.data.pid,
-      text: clean,
-      ts: Date.now(),
-    };
-    pushHistory(rooms[code], msg);
-    io.to(code).emit('chat:message', msg);
-  });
-
-  /* Delivery receipt: recipients confirm, the sender counts them. */
-  on('msg:ack', (arg) => {
-    const { id, to } = arg || {};
-    const sid = inSameRoom(socket, to);
-    if (typeof id !== 'string' || id.length > 64 || !sid) return;
-    if (!allow('misc')) return;
-    io.to(sid).emit('msg:ack', { id, from: socket.data.pid, label: socket.data.label });
-  });
-
+  /* ── Chat ───────────────────────────────────────────────────
+     Messages, replies, reactions and read receipts travel peer to peer
+     over the same links as files; the server never sees them. All it
+     carries is "someone is typing". */
   on('chat:typing', (isTyping) => {
     const { code, label } = socket.data;
     if (!code || !allow('typing')) return;
@@ -1023,4 +997,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { start, server, io, rooms, CODE_LENGTH, targetBacklog };
+module.exports = { start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory };
