@@ -703,8 +703,34 @@ io.on('connection', (socket) => {
     }
     if (!targets.length) return reply({ error: 'That device is not online any more.' });
 
+    const inviterId = typeof arg.clientId === 'string' && ID_RE.test(arg.clientId) ? arg.clientId : me.clientId;
     let room;
     let code;
+
+    // Not in a room, and the other device already is: go to them rather
+    // than pull them out into a new room. Someone who left and comes back
+    // lands in the same room.
+    const theirs = arg.code === undefined && !socket.data.code
+      ? targets.map(s => s.data.code && rooms[s.data.code]).find(r => r && r.users.length < MAX_USERS)
+      : null;
+    if (theirs) {
+      if (token) {
+        // A remembered device: straight in.
+        if (inviterId) rememberMember(theirs, inviterId);
+        return reply({ code: theirs.code });
+      }
+      // Anyone else nearby knocks, and someone in the room lets them in.
+      const kid = newPid();
+      for (const s of targets) {
+        if (!s.data.code || rooms[s.data.code] !== theirs) continue;
+        const knocks = s.data.knocks || (s.data.knocks = new Map());
+        if (knocks.size >= 20) knocks.delete(knocks.keys().next().value);
+        knocks.set(kid, { code: theirs.code, from: socket, clientId: inviterId, at: Date.now() });
+        s.emit('presence:knock', { kid, from: me.name, kind: me.kind });
+      }
+      return reply({ waiting: true, kid });
+    }
+
     if (arg.code !== undefined) {
       // Only into the room the inviter is actually in.
       if (arg.code !== socket.data.code || !rooms[arg.code]) return reply({ error: 'Bad request.' });
@@ -713,7 +739,7 @@ io.on('connection', (socket) => {
       if (room.users.length >= MAX_USERS) return reply({ error: 'This room is full.' });
     } else {
       if (!ipBucket(ip, 'create').take(1)) return reply({ error: SLOW_DOWN });
-      const res = createRoom(ip, typeof arg.clientId === 'string' ? arg.clientId : null);
+      const res = createRoom(ip, inviterId);
       if (res.error) return reply({ error: res.error });
       ({ code, room } = res);
     }
@@ -724,6 +750,26 @@ io.on('connection', (socket) => {
       s.emit('presence:invited', { code, from: me.name, kind: me.kind, token, nid: me.nid });
     }
     reply({ code });
+  });
+
+  /* Answer a knock on the room this device is in. */
+  const KNOCK_TTL_MS = 2 * 60 * 1000;
+  on('presence:answer', (arg) => {
+    const me = socket.data.presence;
+    const knocks = socket.data.knocks;
+    const k = arg && typeof arg.kid === 'string' && knocks && knocks.get(arg.kid);
+    if (!me || !k || !allow('misc')) return;
+    knocks.delete(arg.kid);
+    const from = k.from;
+    if (!from.connected || Date.now() - k.at > KNOCK_TTL_MS) return;
+    const room = rooms[k.code];
+    if (!arg.ok) return from.emit('presence:declined', { kid: arg.kid, from: me.name });
+    // Only into the room this device is still in, and only if there is space.
+    if (!room || socket.data.code !== k.code || room.users.length >= MAX_USERS) {
+      return from.emit('presence:declined', { kid: arg.kid, from: me.name });
+    }
+    if (k.clientId) rememberMember(room, k.clientId);
+    from.emit('presence:invited', { code: k.code, from: me.name, kind: me.kind, token: null, nid: me.nid, kid: arg.kid });
   });
 
   /* Forgetting a pairing tells the other device to forget it too. */

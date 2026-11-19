@@ -333,6 +333,13 @@ function startPresence(socket, on) {
     const paired = inv.token ? getPaired().find(p => p.token === inv.token) : null;
     on.invited(Object.assign({}, inv, { paired, from: paired ? paired.name : cleanDeviceName(inv.from) || 'A device' }));
   });
+  socket.on('presence:knock', (k) => {
+    if (!k || typeof k.kid !== 'string' || !on.knock) return;
+    on.knock({ kid: k.kid, kind: k.kind, from: cleanDeviceName(k.from) || 'A device' });
+  });
+  socket.on('presence:declined', (d) => {
+    if (d && typeof d.kid === 'string' && on.declined) on.declined({ kid: d.kid, from: cleanDeviceName(d.from) || 'They' });
+  });
   return {
     state,
     hello,
@@ -345,6 +352,7 @@ function startPresence(socket, on) {
         });
       });
     },
+    answer(kid, ok) { socket.emit('presence:answer', { kid, ok: !!ok }); },
     forget(token) {
       socket.emit('presence:forget', { token });
       removePaired(token);
@@ -604,7 +612,8 @@ if (!isRoomPage) {
   const deviceNameEl = document.getElementById('device-name');
   deviceNameEl.textContent = getDevice().name;
 
-  const presence = startPresence(socket, { change: renderDevices, invited: onInvited });
+  const presence = startPresence(socket, { change: renderDevices, invited: onInvited, declined: onDeclined });
+  let knocking = null;   // { kid, btn }: waiting to be let into someone's room
 
   function renderDevices() {
     const { paired, nearby } = presence.list();
@@ -620,9 +629,34 @@ if (!isRoomPage) {
     btn.textContent = 'Connecting…';
     const res = await presence.invite(dev.paired ? { token: dev.token } : { to: dev.id });
     if (res.code) { window.location.href = '/join/' + res.code; return; }
+    if (res.waiting && res.kid) {
+      // They are in a room already: wait for them to let us in.
+      btn.textContent = 'Waiting for ' + dev.name + '…';
+      const kid = res.kid;
+      knocking = { kid, btn };
+      setTimeout(() => {
+        if (!knocking || knocking.kid !== kid) return;
+        knocking = null;
+        showError(dev.name + ' did not answer. Try again.');
+        resetConnect(btn);
+      }, 2 * 60 * 1000);
+      return;
+    }
     showError(res.error || 'Could not connect. Try again.');
+    resetConnect(btn);
+  }
+
+  function resetConnect(btn) {
     btn.disabled = false;
     btn.textContent = 'Connect';
+  }
+
+  function onDeclined(d) {
+    if (!knocking || knocking.kid !== d.kid) return;
+    const { btn } = knocking;
+    knocking = null;
+    showError(d.from + ' did not let you in this time.');
+    resetConnect(btn);
   }
 
   function forgetDevice(dev) {
@@ -634,7 +668,8 @@ if (!isRoomPage) {
      is the point of remembering it. Anyone else nearby has to be accepted. */
   let inviteTimer = null;
   function onInvited(inv) {
-    if (inv.paired) { window.location.href = '/join/' + inv.code; return; }
+    // Remembered devices, and the room we just asked to be let into, open at once.
+    if (inv.paired || (knocking && inv.kid && inv.kid === knocking.kid)) { window.location.href = '/join/' + inv.code; return; }
     inviteIn.replaceChildren();
     const p = document.createElement('p');
     p.className = 'invite-in-text';
@@ -2966,7 +3001,31 @@ if (isRoomPage) {
   }
 
   /* ── Nearby and remembered devices, from inside a room ─────── */
-  const presence = startPresence(socket, { change: paintNearbyCount, invited: onInvitedInRoom });
+  const presence = startPresence(socket, { change: paintNearbyCount, invited: onInvitedInRoom, knock: onKnock });
+
+  /* Someone nearby who is not in a room asked to join this one. */
+  function onKnock(k) {
+    const bar = document.createElement('div');
+    bar.className = 'share-confirm';
+    bar.setAttribute('role', 'dialog');
+    const title = document.createElement('p');
+    title.className = 'share-confirm-title';
+    title.textContent = kindIcon(k.kind) + ' ' + k.from + ' (on this Wi-Fi) wants to join this room.';
+    const actions = document.createElement('div');
+    actions.className = 'share-confirm-actions';
+    const no = document.createElement('button');
+    no.type = 'button'; no.className = 'btn btn-ghost btn-sm'; no.textContent = 'Not now';
+    const yes = document.createElement('button');
+    yes.type = 'button'; yes.className = 'btn btn-primary btn-sm'; yes.textContent = 'Let in';
+    actions.append(no, yes);
+    bar.append(title, actions);
+    document.querySelector('.composer').before(bar);
+    noteArrival(k.from + ' wants to join', 'Open HalwaShare to let them in');
+    const answer = (ok) => { presence.answer(k.kid, ok); bar.remove(); clearTimeout(t); };
+    no.addEventListener('click', () => answer(false));
+    yes.addEventListener('click', () => answer(true));
+    const t = setTimeout(() => bar.remove(), 2 * 60 * 1000);
+  }
   const nearbyCount = $('nearby-count');
 
   function paintNearbyCount() {
@@ -3021,7 +3080,7 @@ if (isRoomPage) {
         return ul.children.length ? [t, ul] : [t, e];
       };
       body.replaceChildren(
-        ...sec('Your devices', paired, 'None yet. Tap a person in the room and choose Remember this device.'),
+        ...sec('Your devices', paired, 'None yet. Tap a person in the room and choose Remember this device. It works across different Wi-Fi networks, so next time no code is needed.'),
         ...sec('Nearby on this network', nearby, 'Nobody else nearby has HalwaShare open.'),
       );
     };

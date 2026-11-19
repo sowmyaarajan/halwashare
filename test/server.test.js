@@ -598,6 +598,62 @@ test('device names become room labels, kept unique', async () => {
   assert.equal(jc.label, 'User 1');
 });
 
+test('a remembered device that left goes back into the room the other is still in', async () => {
+  const a = await connected(client({ ip: '10.7.6.1' }));
+  const b = await connected(client({ ip: '10.7.7.1' }));   // different networks
+  hello(a, 'Laptop', 'devLlllllllllllllll', [TOK('l')], 'lapTab1');
+  hello(b, 'Phone', 'devMmmmmmmmmmmmmmmm', [TOK('l')], 'phnTab1');
+  await sleep(80);
+  const { code } = await call(a, 'room:create', { clientId: 'lapTab1' });
+  await call(a, 'room:join', { code, clientId: 'lapTab1' });
+  // b, on its start page, connects: it is sent to a's room, no new room.
+  const res = await call(b, 'presence:invite', { token: TOK('l'), clientId: 'phnTab1' });
+  assert.equal(res.code, code);
+  const j = await call(b, 'room:join', { code, clientId: 'phnTab1', name: 'Phone' });
+  assert.equal(j.label, 'Phone');
+});
+
+test('a nearby device knocks on a room, and comes in only when let in', async () => {
+  const ip = '10.7.8.1';
+  const a = await connected(client({ ip }));
+  const b = await connected(client({ ip }));
+  hello(a, 'Laptop', 'devNnnnnnnnnnnnnnnn', [], 'lapTab2');
+  await sleep(50);
+  const seen = next(b, 'presence:nearby');
+  hello(b, 'Phone', 'devOoooooooooooooooo', [], 'phnTab2');
+  const list = await seen;
+  const { code } = await call(a, 'room:create', { clientId: 'lapTab2' });
+  await call(a, 'room:join', { code, clientId: 'lapTab2' });
+
+  // First knock: declined.
+  let knock = next(a, 'presence:knock');
+  let res = await call(b, 'presence:invite', { to: list[0].id, clientId: 'phnTab2' });
+  assert.equal(res.waiting, true);
+  assert.equal(res.code, undefined);         // no code until let in
+  let k = await knock;
+  assert.equal(k.from, 'Phone');
+  const declined = next(b, 'presence:declined');
+  a.emit('presence:answer', { kid: k.kid, ok: false });
+  assert.equal((await declined).kid, res.kid);
+  // An answer cannot be replayed, nor given by someone else.
+  const c = await connected(client({ ip }));
+  hello(c, 'Other', 'devPpppppppppppppppp');
+  await sleep(50);
+  c.emit('presence:answer', { kid: k.kid, ok: true });
+  await silent(b, 'presence:invited', 200);
+
+  // Second knock: let in, with the room's code.
+  knock = next(a, 'presence:knock');
+  res = await call(b, 'presence:invite', { to: list[0].id, clientId: 'phnTab2' });
+  k = await knock;
+  const invited = next(b, 'presence:invited');
+  a.emit('presence:answer', { kid: k.kid, ok: true });
+  const inv = await invited;
+  assert.equal(inv.code, code);
+  assert.equal(inv.kid, res.kid);
+  assert.ok((await call(b, 'room:join', { code, clientId: 'phnTab2' })).selfId);
+});
+
 test('wrong guesses spread over many addresses hit a site-wide cap', async () => {
   // A room someone was already in before the attack starts.
   const host = await connected(client({ ip: '10.67.0.1' }));
