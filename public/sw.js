@@ -154,17 +154,20 @@ self.addEventListener('fetch', (event) => {
    message was encrypted for this device alone, and signed with the
    pairing token: only a ring from a pairing this device still holds
    shows a name and opens a room. Anything else is shown plainly (every
-   push must show something). After three such rings in a row this push
-   address is retired, so a device that was forgotten cannot keep ringing;
-   remembered devices get the new one the next time they meet in a room. */
+   push must show something). Three such rings within a day retire this
+   push address, so a device that was forgotten cannot keep ringing; a
+   genuine ring in between does not wipe the count. Remembered devices
+   get the new address the next time they meet in a room. */
 const RING_FAILS_TO_RETIRE = 3;
+const RING_FAIL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function b64url(buf) {
   return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-/* { ring } when verified, { bad: true } when the list was read and nothing
-   matched, {} when it could not be checked at all. */
+/* { ring } when verified, otherwise { bad: true } — including when the
+   list of pairings cannot be read: a ring that cannot be checked is not
+   trusted. (The page rewrites the list every time it opens.) */
 async function checkRing(d) {
   if (!d || d.t !== 'ring' || typeof d.code !== 'string' || !/^\d{6}$/.test(d.code) || typeof d.mac !== 'string') {
     return { bad: true };
@@ -172,10 +175,10 @@ async function checkRing(d) {
   let list;
   try {
     const res = await (await caches.open('halwa-paired')).match('/__paired');
-    if (!res) return {};
+    if (!res) return { bad: true };
     list = await res.json();
-  } catch (_) { return {}; }
-  if (!Array.isArray(list)) return {};
+  } catch (_) { return { bad: true }; }
+  if (!Array.isArray(list)) return { bad: true };
   const enc = new TextEncoder();
   for (const p of list) {
     if (!p || typeof p.token !== 'string') continue;
@@ -186,18 +189,21 @@ async function checkRing(d) {
   return { bad: true };
 }
 
-async function countRingFailure(reset) {
+async function countRingFailure() {
   try {
     const cache = await caches.open('halwa-paired');
-    if (reset) return void await cache.delete('/__ring-fails');
     const res = await cache.match('/__ring-fails');
-    const n = (res ? Number(await res.text()) || 0 : 0) + 1;
-    if (n >= RING_FAILS_TO_RETIRE) {
+    let times = [];
+    try { times = res ? await res.json() : []; } catch (_) { times = []; }
+    const now = Date.now();
+    times = (Array.isArray(times) ? times : []).filter(t => typeof t === 'number' && now - t < RING_FAIL_WINDOW_MS);
+    times.push(now);
+    if (times.length >= RING_FAILS_TO_RETIRE) {
       await cache.delete('/__ring-fails');
       const sub = await self.registration.pushManager.getSubscription();
       if (sub) await sub.unsubscribe();
     } else {
-      await cache.put('/__ring-fails', new Response(String(n)));
+      await cache.put('/__ring-fails', new Response(JSON.stringify(times.slice(-10))));
     }
   } catch (_) {}
 }
@@ -206,9 +212,8 @@ self.addEventListener('push', (event) => {
   event.waitUntil((async () => {
     let d = null;
     try { d = event.data && event.data.json(); } catch (_) {}
-    const { ring, bad } = await checkRing(d);
+    const { ring } = await checkRing(d);
     if (ring) {
-      await countRingFailure(true);
       return self.registration.showNotification(ring.name + ' wants to connect', {
         body: 'Tap to join them on HalwaShare',
         tag: 'halwa-ring',
@@ -218,7 +223,7 @@ self.addEventListener('push', (event) => {
         data: { url: '/join/' + ring.code },
       });
     }
-    if (bad) await countRingFailure(false);
+    await countRingFailure();
     return self.registration.showNotification('HalwaShare', {
       body: 'Ignored a ring from a device this one does not remember.',
       tag: 'halwa-ring-ignored',

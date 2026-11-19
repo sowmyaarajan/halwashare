@@ -395,7 +395,12 @@ function cleanSubscription(sub) {
   let endpoint;
   if (/\.notify\.windows\.com$/.test(url.hostname)) {
     if (url.pathname !== '/w/' || !/^\?token=[A-Za-z0-9%._~+\/=-]{1,800}$/.test(url.search)) return null;
-    endpoint = 'https://' + url.hostname + '/w/' + url.search;
+    // The token may be percent-encoded more than one way; decode it and
+    // encode it again the one way, so every spelling is the same address.
+    let token;
+    try { token = decodeURIComponent(url.search.slice(7)); } catch (_) { return null; }
+    if (!/^[A-Za-z0-9._~+\/=-]{1,600}$/.test(token)) return null;
+    endpoint = 'https://' + url.hostname + '/w/?token=' + encodeURIComponent(token);
   } else {
     if (url.search || !/^\/[A-Za-z0-9_:.\/-]{1,900}$/.test(url.pathname) || url.pathname.includes('//')) return null;
     endpoint = 'https://' + url.hostname + url.pathname;

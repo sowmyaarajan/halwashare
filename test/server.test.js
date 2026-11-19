@@ -677,6 +677,10 @@ test('push addresses must belong to a real push service', () => {
   assert.ok(!ok('https://fcm.googleapis.com/fcm//send/abc'));
   assert.ok(!ok('https://fcm.googleapis.com/fcm/send/a%62c'));
   assert.ok(!ok('https://wns2-par02p.notify.windows.com/w/?token=abc&x=1'));
+  // Differently encoded WNS tokens are the same address.
+  const wns = (t) => cleanSubscription({ endpoint: 'https://wns2-par02p.notify.windows.com/w/?token=' + t, keys }).endpoint;
+  assert.equal(wns('AbC%2Bd%3D'), wns('AbC+d='.replace('+', '%2b').replace('=', '%3d')));
+  assert.equal(wns('AbC%2Bd%3D'), wns('AbC%2bd='));
   // and a different case of the host is the same address
   assert.equal(cleanSubscription({ endpoint: 'https://FCM.googleapis.com/fcm/send/abc', keys }).endpoint,
     'https://fcm.googleapis.com/fcm/send/abc');
