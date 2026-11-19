@@ -13,6 +13,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const QRCode = require('qrcode');
+const webpush = require('web-push');
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
@@ -356,6 +357,49 @@ function leavePresence(socket) {
   announceNearby(socket.data.ip);
 }
 
+/* ── Push: knocking on a remembered device that is closed ─────
+   The server keeps no list of devices to notify. A device hands its push
+   address only to the devices it remembers, over their direct link; to
+   knock, one of them gives that address back to the server along with
+   the pairing token. The message itself is encrypted for that one device,
+   so the push service relaying it cannot read it either.
+
+   The keys must stay the same across restarts, or every saved address
+   stops working: set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY. Without them
+   a fresh pair is made at start-up, which is fine for trying it out. */
+const PUSH_HOSTS = /^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|[a-z0-9-]+\.notify\.windows\.com|[a-z0-9-]+(\.[a-z0-9-]+)*\.push\.apple\.com)$/;
+const B64URL_RE = /^[A-Za-z0-9_-]+$/;
+const vapid = (() => {
+  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+    return { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
+  }
+  if (process.env.NODE_ENV !== 'test') {
+    console.warn('[halwa] VAPID keys not set: knocks on closed devices stop working after a restart');
+  }
+  return webpush.generateVAPIDKeys();
+})();
+const pushSubject = process.env.VAPID_SUBJECT ||
+  (/^https:\/\//.test(process.env.PUBLIC_URL || '') ? process.env.PUBLIC_URL : 'mailto:halwashare@example.com');
+webpush.setVapidDetails(pushSubject, vapid.publicKey, vapid.privateKey);
+
+/* A push address, checked: only real push services, so the server can
+   never be made to send requests anywhere else. */
+function cleanSubscription(sub) {
+  if (!sub || typeof sub !== 'object' || typeof sub.endpoint !== 'string' || sub.endpoint.length > 1024) return null;
+  let url;
+  try { url = new URL(sub.endpoint); } catch (_) { return null; }
+  if (url.protocol !== 'https:' || (url.port && url.port !== '443') || url.username || url.password) return null;
+  if (!PUSH_HOSTS.test(url.hostname)) return null;
+  const keys = sub.keys || {};
+  if (typeof keys.p256dh !== 'string' || !B64URL_RE.test(keys.p256dh) || keys.p256dh.length < 80 || keys.p256dh.length > 100) return null;
+  if (typeof keys.auth !== 'string' || !B64URL_RE.test(keys.auth) || keys.auth.length < 16 || keys.auth.length > 32) return null;
+  return { endpoint: url.href, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+}
+
+let sendPush = (sub, payload, options) => webpush.sendNotification(sub, payload, options);
+const lastKnock = new Map();   // token -> time, so one pair cannot be rung non-stop
+const KNOCK_GAP_MS = 15 * 1000;
+
 /* ── HTTP ──────────────────────────────────────────────────── */
 const app = express();
 app.disable('x-powered-by');
@@ -401,6 +445,8 @@ app.get('/favicon.ico', (_req, res) => {
    answers it on the device; this only catches a share that arrives before
    the worker is running, so the person lands on the app, not an error. */
 app.post('/share-target', (_req, res) => res.redirect(303, '/?shared=0'));
+
+app.get('/api/push-key', (_req, res) => res.json({ key: vapid.publicKey }));
 
 app.get('/join/:code', (req, res) => {
   if (!CODE_RE.test(req.params.code)) return res.redirect('/');
@@ -754,6 +800,38 @@ io.on('connection', (socket) => {
     reply({ code });
   });
 
+  /* Ring a remembered device that does not have HalwaShare open: make a
+     room and send it a notification that opens it. */
+  on('presence:ring', async (arg, cb) => {
+    const reply = typeof cb === 'function' ? cb : () => {};
+    const me = socket.data.presence;
+    if (!me || !arg || typeof arg !== 'object') return reply({ error: 'Bad request.' });
+    const token = arg.token;
+    if (typeof token !== 'string' || !me.tokens.has(token)) return reply({ error: 'Bad request.' });
+    const sub = cleanSubscription(arg.sub);
+    if (!sub) return reply({ error: 'That device cannot be notified.', gone: true });
+    if (!allow('invite')) return reply({ error: SLOW_DOWN });
+    const now = Date.now();
+    if (now - (lastKnock.get(token) || 0) < KNOCK_GAP_MS) return reply({ error: 'Already notified — give them a moment.' });
+    if (!ipBucket(ip, 'create').take(1)) return reply({ error: SLOW_DOWN });
+    lastKnock.set(token, now);
+    if (lastKnock.size > 10000) lastKnock.delete(lastKnock.keys().next().value);
+
+    const inviterId = typeof arg.clientId === 'string' && ID_RE.test(arg.clientId) ? arg.clientId : me.clientId;
+    const res = createRoom(ip, inviterId);
+    if (res.error) return reply({ error: res.error });
+    const payload = JSON.stringify({ t: 'ring', code: res.code, from: me.name, kind: me.kind });
+    try {
+      await sendPush(sub, payload, { TTL: 120, urgency: 'high', topic: 'halwa-ring', timeout: 8000 });
+      reply({ code: res.code });
+    } catch (err) {
+      const status = err && err.statusCode;
+      // 404 / 410: that address is dead; the device was reset or uninstalled.
+      if (status === 404 || status === 410) return reply({ error: 'That device can no longer be notified.', gone: true });
+      reply({ error: 'Could not send the notification. Try again.' });
+    }
+  });
+
   /* Answer a knock on the room this device is in. */
   const KNOCK_TTL_MS = 2 * 60 * 1000;
   on('presence:answer', (arg) => {
@@ -997,4 +1075,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory };
+module.exports = {
+  start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory, cleanSubscription,
+  setPushSender: (fn) => { sendPush = fn; },
+};

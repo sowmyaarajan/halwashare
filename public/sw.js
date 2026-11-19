@@ -150,6 +150,27 @@ self.addEventListener('fetch', (event) => {
 
 /* ── Notifications ──────────────────────────────────────────
    Tapping one brings the room back to the front, or reopens it. */
+/* A remembered device rang this one while HalwaShare was closed. The
+   message was encrypted for this device alone; tapping it opens the room. */
+self.addEventListener('push', (event) => {
+  let d = null;
+  try { d = event.data && event.data.json(); } catch (_) {}
+  const ok = d && d.t === 'ring' && typeof d.code === 'string' && /^\d{6}$/.test(d.code);
+  const from = ok && typeof d.from === 'string' ? d.from.slice(0, 40) : 'A remembered device';
+  // Browsers require every push to show something.
+  event.waitUntil(self.registration.showNotification(
+    ok ? from + ' wants to connect' : 'HalwaShare',
+    {
+      body: ok ? 'Tap to join them on HalwaShare' : 'Open HalwaShare',
+      tag: 'halwa-ring',
+      renotify: true,
+      requireInteraction: true,
+      icon: '/icons/icon-192.png',
+      data: { url: ok ? '/join/' + d.code : '/' },
+    }
+  ));
+});
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const path = (event.notification.data && event.notification.data.url) || '/';

@@ -17,7 +17,7 @@ code in the room sidebar.
 - **Whole folders** (📎 → Folder, or drag one in, on a computer): they arrive as one .zip, built while it streams, so even a huge folder never sits in memory.
 - **What I copied** (📎): sends the text or picture on your clipboard; the others tap Copy.
 - **Share my screen** (📎, on a computer): everyone in the room watches live, over a direct link.
-- **Chat**, with read receipts, a typing indicator and pasted screenshots.
+- **Chat**, with replies, reactions (👍 ❤️ 😂 😮 🙏 ✅), read receipts, a typing indicator and pasted screenshots. Messages go straight from device to device, like files; the server never sees them. Each page keeps its room's chat through a refresh, and someone who joins late is handed what the people in the room wrote.
 - **Voice notes**: tap 🎙️, speak, tap ⏹. They arrive on their own and play inline.
 - **Safety code**: tap a person to see twelve pictures. If their screen shows the same twelve, your direct link goes straight to them, with nobody in between.
 - **Screen stays on** while others are in the room, so a phone does not sleep and drop out (☕ turns this off).
@@ -27,11 +27,13 @@ code in the room sidebar.
 
 - **Nearby**: other devices with HalwaShare open on the same network (the same public address) show on the start page and under 📡 in a room. Tap *Connect* and they are asked to join.
 - **Your devices**: in a room, tap a person and choose *Remember this device*. From then on it appears on the start page whenever it is online, and *Connect* takes both straight into a new room, no questions asked. *✕* forgets it on both sides.
+- **Ring a closed device**: a remembered device that does not have HalwaShare open shows *closed — can be rung* (if it allowed notifications when you paired). *🔔 Ring* opens a room and sends it a notification; tapping that joins you. On iPhone and iPad this needs HalwaShare added to the Home Screen (iOS 16.4 or later).
 - **Same room again**: if the other device is already in a room, *Connect* takes you into that room instead of starting a new one. A remembered device goes straight in when it is alone in that room; otherwise (a nearby device, or others in the room too) it knocks and someone in the room taps *Let in*.
 
 Each device has a name (shown in rooms instead of "User 2"). Change it with *Rename* on the start page, or in a room by tapping your own name (✏️) — everyone sees the new name at once.
 On a shared network — an office, a café — everyone with HalwaShare open sees that name. *Hide me from nearby* on the start page takes the device off the list (and hides the list from it); remembered devices still find it.
 A remembered pair shares a random token made of a half from each side; the server only matches tokens and never learns which devices are behind them.
+For ringing, each device hands its push address only to the devices it remembers, over their direct link. The server keeps no list of them: the ringing device sends the address along with the ring, the server checks it belongs to a real push service (Google, Mozilla, Apple or Microsoft) and sends one message, encrypted so only that device can read it.
 
 ## Browser extension
 
@@ -154,6 +156,15 @@ address:
 PUBLIC_URL=https://halwashare.onrender.com
 ```
 
+For *Ring*, also set a VAPID key pair (make one with `npx web-push generate-vapid-keys`).
+They must stay the same: if they change, every device has to open HalwaShare
+once more before it can be rung again.
+
+```
+VAPID_PUBLIC_KEY=...
+VAPID_PRIVATE_KEY=...
+```
+
 Render terminates TLS for you, so every visitor gets a secure context and
 therefore unlimited-size streaming. `PORT` is injected by Render and already
 honoured; the server binds `0.0.0.0`.
@@ -209,8 +220,9 @@ stranger and a room. The server is built to be safe on the open internet:
 | Guessing room codes | 6-digit random codes (900,000 possibilities); wrong guesses are limited to ~20 a minute per address (a whole IPv6 /64 counts as one), and reconnecting does not reset that. A site-wide cap of `GLOBAL_MISSES_PER_MIN` (default 300) stops guesses spread over many addresses; people already in a room get back in even while it is spent |
 | Flooding the server with rooms | Room creation limited per IP, at most `MAX_ROOMS_PER_IP` open per address, `MAX_ROOMS` in total; empty rooms expire after 2 minutes |
 | Malformed messages | Strict type checks, and every handler is guarded: a bad message drops that connection, never the server |
-| Exhausting memory | Chat history capped at 128 KB per room; a receiver that stops reading is not buffered for |
-| Floods of chat, signalling or relay bytes | Per-connection rate limits; relay bytes and messages are paced (never dropped), counted against a backlog cap, and a sender ignoring flow control is disconnected |
+| Exhausting memory | Room history (file offers, joins) capped at 128 KB per room; chat is not kept on the server at all; a receiver that stops reading is not buffered for |
+| Making the server send requests elsewhere | Rings go only to known push services over https on the standard port; at most one ring per pairing every 15 seconds |
+| Floods of signalling or relay bytes | Per-connection rate limits; relay bytes and messages are paced (never dropped), counted against a backlog cap, and a sender ignoring flow control is disconnected |
 | Floods of pictures | Receivers auto-fetch only small images, up to 60 MB per visit; everything else waits for a click |
 | Too many connections | `MAX_CONN_PER_IP` open sockets per address |
 | Other websites driving a visitor's browser | Socket.io refuses connections whose `Origin` is not this site |
@@ -229,9 +241,9 @@ Run `npm test` after changing the server.
 ## Layout
 
 ```
-server.js         static hosting, signalling, chat, fallback relay, limits
+server.js         static hosting, signalling, presence, rings, fallback relay, limits
 public/app.js     peers, transports, sinks, transfer protocol, UI
-public/sw.js      streaming downloads + share target
+public/sw.js      streaming downloads, share target, rings
 public/manifest.webmanifest, public/icons/   the installable app
 public/style.css  light + dark theme
 test/             server tests — npm test
@@ -243,7 +255,7 @@ Environment: `PORT` (default 4000), `MAX_USERS` (default 5), `PUBLIC_URL`,
 `MAX_CONN_PER_IP` (default 30), `ROOM_GRACE_MS` (default 120000),
 `RELAY_BYTES_PER_SEC` (default 16 MB/s), `GLOBAL_MISSES_PER_MIN` (default 300),
 `USER_GRACE_MS` (default 180000),
-`TRUST_PROXY`, `CLIENT_IP_HEADER`.
+`TRUST_PROXY`, `CLIENT_IP_HEADER`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`.
 
 ## Protocol
 
@@ -258,7 +270,12 @@ transfer tag so several files can share one link without mixing up.
 | `ack` | receiver → owner | relay flow control |
 | `err` | owner → receiver | could not serve it |
 | `pair-req` / `pair-ok` / `pair-no` | either way | remember this device: each side sends half of the pairing secret |
+| `chat` / `chat-ack` | either way | a message (`id`, `text`, `ts`, optional `reply` key) and its receipt |
+| `chat-sync` | either way, when a link opens | the sender's own earlier messages and reactions |
+| `react` | either way | add or remove a reaction (`key`, `emoji`, `on`) |
+| `paired` | either way, when a link opens | proofs of the pairings held, each bound to this one link |
+| `push-sub` | between remembered devices | this device's push address, for ringing it later |
 
 Screen sharing uses its own `RTCPeerConnection` per viewer, signalled with `scr-offer`, `scr-answer`, `scr-ice` and `scr-stop` through `rtc:signal`.
 
-Presence events (socket.io): `presence:hello` (name, kind, device id, pairing tokens), `presence:nearby`, `presence:paired`, `presence:invite` → `presence:invited`, `presence:forget` → `presence:forgotten`.
+Presence events (socket.io): `presence:hello` (name, kind, device id, pairing tokens), `presence:nearby`, `presence:paired`, `presence:invite` → `presence:invited`, `presence:forget` → `presence:forgotten`, `presence:knock` / `presence:answer` (asking to join a room someone is already in), `presence:ring` (wake a closed remembered device).

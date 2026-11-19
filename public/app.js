@@ -283,6 +283,48 @@ function removePaired(token) {
   savePaired(getPaired().filter(p => p.token !== token));
 }
 
+/* Keep a remembered device's push address (or drop it with null). */
+function setPairedPush(token, sub) {
+  const list = getPaired();
+  const rec = list.find(p => p.token === token);
+  if (!rec) return;
+  if (sub) rec.push = sub; else delete rec.push;
+  savePaired(list);
+}
+
+/* This device's push address, for the devices it remembers, so they can
+   ring it while HalwaShare is closed. Null when the browser cannot do
+   push or the person has not allowed notifications. */
+async function myPushAddress() {
+  try {
+    if (!window.isSecureContext || !('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+    if (!('Notification' in window) || Notification.permission !== 'granted') return null;
+    const reg = await navigator.serviceWorker.ready;
+    const res = await fetch('/api/push-key');
+    const { key } = await res.json();
+    if (typeof key !== 'string') return null;
+    let sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      // Made for another server key (the server's keys changed): replace it.
+      const had = sub.options && sub.options.applicationServerKey;
+      if (had && b64url(new Uint8Array(had)) !== key) { await sub.unsubscribe(); sub = null; }
+    }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    const j = sub.toJSON();
+    return j && j.endpoint && j.keys ? { endpoint: j.endpoint, keys: { p256dh: j.keys.p256dh, auth: j.keys.auth } } : null;
+  } catch (_) { return null; }
+}
+
+/* Ask for notifications from a tap (browsers only allow it then). */
+function askNotifyPermission() {
+  try {
+    if ('Notification' in window && Notification.permission === 'default') {
+      return Notification.requestPermission().catch(() => 'default');
+    }
+  } catch (_) {}
+  return Promise.resolve('Notification' in window ? Notification.permission : 'denied');
+}
+
 /* Whether other devices on this network may see this one. */
 function isVisibleNearby() {
   try { return localStorage.getItem('halwa-visible') !== '0'; } catch (_) { return true; }
@@ -354,6 +396,13 @@ function startPresence(socket, on) {
       });
     },
     answer(kid, ok) { socket.emit('presence:answer', { kid, ok: !!ok }); },
+    ring(token, sub) {
+      return new Promise((resolve) => {
+        socket.timeout(15000).emit('presence:ring', { token, sub, clientId: getClientId() }, (err, res) => {
+          resolve(err ? { error: 'No answer from the server. Try again.' } : (res || { error: 'Try again.' }));
+        });
+      });
+    },
     forget(token) {
       socket.emit('presence:forget', { token });
       removePaired(token);
@@ -363,7 +412,10 @@ function startPresence(socket, on) {
     },
     /* Remembered devices first (online ones on top), then strangers nearby. */
     list() {
-      const paired = getPaired().map(p => ({ paired: true, token: p.token, name: p.name, kind: p.kind, online: !!state.online.get(p.token) }));
+      const paired = getPaired().map(p => ({
+        paired: true, token: p.token, name: p.name, kind: p.kind,
+        online: !!state.online.get(p.token), push: p.push || null,
+      }));
       paired.sort((a, b) => Number(b.online) - Number(a.online));
       // A remembered device that is online is listed once, under its pairing.
       const known = new Set(paired.filter(p => p.online).map(p => p.name));
@@ -376,7 +428,7 @@ function startPresence(socket, on) {
 }
 
 /* One row in a device list. */
-function deviceRow(dev, actionLabel, onAction, onForget) {
+function deviceRow(dev, actionLabel, onAction, onForget, onRing) {
   const li = document.createElement('li');
   li.className = 'device-item' + (dev.online ? '' : ' offline');
   const icon = document.createElement('span');
@@ -389,7 +441,7 @@ function deviceRow(dev, actionLabel, onAction, onForget) {
   name.textContent = dev.name;
   const st = document.createElement('span');
   st.className = 'device-state';
-  st.textContent = dev.paired ? (dev.online ? 'online' : 'offline') : 'nearby';
+  st.textContent = dev.paired ? (dev.online ? 'online' : dev.push ? 'closed — can be rung' : 'offline') : 'nearby';
   text.append(name, st);
   li.append(icon, text);
   if (dev.online) {
@@ -398,6 +450,15 @@ function deviceRow(dev, actionLabel, onAction, onForget) {
     btn.className = 'btn btn-primary btn-sm';
     btn.textContent = actionLabel;
     btn.addEventListener('click', () => onAction(dev, btn));
+    li.appendChild(btn);
+  } else if (onRing && dev.push) {
+    // Closed, but it can be woken with a notification.
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-ghost btn-sm';
+    btn.textContent = '🔔 Ring';
+    btn.title = 'Send ' + dev.name + ' a notification to join you';
+    btn.addEventListener('click', () => onRing(dev, btn));
     li.appendChild(btn);
   }
   if (onForget) {
@@ -618,7 +679,7 @@ if (!isRoomPage) {
 
   function renderDevices() {
     const { paired, nearby } = presence.list();
-    myDevicesEl.replaceChildren(...paired.map(d => deviceRow(d, 'Connect', connectTo, forgetDevice)));
+    myDevicesEl.replaceChildren(...paired.map(d => deviceRow(d, 'Connect', connectTo, forgetDevice, ringDevice)));
     nearbyEl.replaceChildren(...nearby.map(d => deviceRow(d, 'Connect', connectTo)));
     document.getElementById('my-devices-empty').classList.toggle('hidden', paired.length > 0);
     document.getElementById('nearby-empty').classList.toggle('hidden', nearby.length > 0);
@@ -645,6 +706,26 @@ if (!isRoomPage) {
     }
     showError(res.error || 'Could not connect. Try again.');
     resetConnect(btn);
+  }
+
+  async function ringDevice(dev, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Ringing…';
+    const res = await presence.ring(dev.token, dev.push);
+    if (res.code) {
+      try { sessionStorage.setItem('halwa-ringing', dev.name); } catch (_) {}
+      window.location.href = '/join/' + res.code;
+      return;
+    }
+    if (res.gone) {
+      setPairedPush(dev.token, null);
+      renderDevices();
+      showError(dev.name + ' can no longer be rung. Open HalwaShare there once and it will work again.');
+      return;
+    }
+    showError(res.error || 'Could not ring. Try again.');
+    btn.disabled = false;
+    btn.textContent = '🔔 Ring';
   }
 
   function resetConnect(btn) {
@@ -971,6 +1052,13 @@ if (isRoomPage) {
         res.history.forEach(renderHistoryEntry);
         restoreChat();
         showCapabilityNote();
+        try {
+          const ringing = sessionStorage.getItem('halwa-ringing');
+          if (ringing) {
+            sessionStorage.removeItem('halwa-ringing');
+            toast('🔔 ' + ringing + ' has been sent a notification — waiting for them to join');
+          }
+        } catch (_) {}
         offerSharedFiles();
       } else {
         catchUp(res.history);
@@ -1293,9 +1381,11 @@ if (isRoomPage) {
         });
       }
       clearTimeout(this.graceTimer);
-      // A link that just came up: hand them the chat they missed.
+      // A link that just came up: hand them the chat they missed, and
+      // prove which remembered pairings we hold, so a device that
+      // remembers this one can tell.
       if ((mode === 'p2p' || mode === 'relay') && prev !== 'p2p' && prev !== 'relay') {
-        setTimeout(() => syncChatTo(this), 0);
+        setTimeout(() => { syncChatTo(this); sendPairProofs(this); }, 0);
       }
       const waiters = this.openWaiters;
       this.openWaiters = [];
@@ -1735,6 +1825,23 @@ if (isRoomPage) {
       case 'react':
         applyReact(peer.id, msg.key, msg.emoji, msg.on !== false);
         break;
+
+      case 'paired': {               // proofs of the pairings they hold
+        if (Array.isArray(msg.proofs)) matchPairProofs(peer, msg.proofs.slice(0, 50).filter(x => typeof x === 'string'));
+        break;
+      }
+
+      case 'push-sub': {             // a remembered device's push address
+        const rec = typeof msg.token === 'string' && getPaired().find(p => p.token === msg.token);
+        // Only from the device that pairing belongs to.
+        if (!rec || peer.pairedToken !== msg.token) break;
+        if (msg.sub === null) { setPairedPush(msg.token, null); break; }
+        if (msg.sub && typeof msg.sub.endpoint === 'string' && msg.sub.endpoint.length < 1024 &&
+            msg.sub.keys && typeof msg.sub.keys.p256dh === 'string' && typeof msg.sub.keys.auth === 'string') {
+          setPairedPush(msg.token, { endpoint: msg.sub.endpoint, keys: { p256dh: msg.sub.keys.p256dh.slice(0, 100), auth: msg.sub.keys.auth.slice(0, 40) } });
+        }
+        break;
+      }
 
       case 'pair-req':               // they want to remember this device
         if (PAIR_TOKEN_RE.test(msg.part)) askPair(peer, msg);
@@ -3247,7 +3354,41 @@ if (isRoomPage) {
      The halves travel over the direct link when there is one. */
   const pairPending = new Map();   // peer id -> our half
 
+  /* Proof of holding a pairing token, made for one link only: it names
+     who sends it and who receives it, so it cannot be replayed to anyone
+     else, and it says nothing about the token itself. */
+  async function pairProof(token, from, to) {
+    const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('halwa-pair-proof-v1|' + token + '|' + from + '|' + to));
+    return b64url(new Uint8Array(d));
+  }
+
+  async function sendPairProofs(peer) {
+    const list = getPaired();
+    if (!list.length || !myId || peer.closed) return;
+    const proofs = await Promise.all(list.map(p => pairProof(p.token, myId, peer.id)));
+    try { peer.sendCtrl({ t: 'paired', proofs }); } catch (_) {}
+  }
+
+  async function matchPairProofs(peer, proofs) {
+    if (!myId) return;
+    const got = new Set(proofs);
+    for (const p of getPaired()) {
+      if (got.has(await pairProof(p.token, peer.id, myId))) {
+        peer.pairedToken = p.token;
+        sendPushAddress(peer, p.token);
+        return;
+      }
+    }
+  }
+
+  async function sendPushAddress(peer, token) {
+    const sub = await myPushAddress();
+    if (!sub) return;
+    try { peer.sendCtrl({ t: 'push-sub', token, sub }); } catch (_) {}
+  }
+
   function requestPair(peer) {
+    askNotifyPermission();      // so they can ring this device later
     const part = randomPart();
     pairPending.set(peer.id, part);
     const d = getDevice();
@@ -3283,6 +3424,7 @@ if (isRoomPage) {
     });
     yes.addEventListener('click', async () => {
       bar.remove();
+      const asked = askNotifyPermission();      // so they can ring this device later
       const part = randomPart();
       const token = await pairToken(msg.part, part);
       addPaired({
@@ -3293,6 +3435,8 @@ if (isRoomPage) {
       try { peer.sendCtrl({ t: 'pair-ok', part, name: d.name, kind: d.kind, device: d.id }); } catch (_) {}
       presence.hello();
       toast('Remembered ' + theirName + ' — it now shows on your start page');
+      peer.pairedToken = token;
+      asked.then(() => sendPushAddress(peer, token));
     });
   }
 
@@ -3308,6 +3452,8 @@ if (isRoomPage) {
     });
     presence.hello();
     toast('Remembered ' + theirName + ' — connect with one tap from the start page next time');
+    const token = getPaired()[0] && getPaired()[0].token;
+    if (token) { peer.pairedToken = token; askNotifyPermission().then(() => sendPushAddress(peer, token)); }
   }
 
   /* ── Nearby and remembered devices, from inside a room ─────── */

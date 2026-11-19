@@ -4,6 +4,7 @@
    between tests. */
 
 process.env.TRUST_PROXY = '1';
+process.env.NODE_ENV = 'test';
 process.env.ROOM_GRACE_MS = '300';
 process.env.USER_GRACE_MS = '400';
 process.env.MAX_ROOMS = '40';
@@ -13,7 +14,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { io: connect } = require('socket.io-client');
 const WebSocket = require('ws');
-const { start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory } = require('../server');
+const { start, server, io, rooms, CODE_LENGTH, targetBacklog, pushHistory, cleanSubscription, setPushSender } = require('../server');
 
 let base;
 let ipSeq = 0;
@@ -655,6 +656,63 @@ test('a nearby device knocks on a room, and comes in only when let in', async ()
   assert.equal(inv.code, code);
   assert.equal(inv.kid, res.kid);
   assert.ok((await call(b, 'room:join', { code, clientId: 'phnTab2' })).selfId);
+});
+
+test('push addresses must belong to a real push service', () => {
+  const keys = { p256dh: 'B'.repeat(87), auth: 'a'.repeat(22) };
+  const ok = (endpoint) => !!cleanSubscription({ endpoint, keys });
+  assert.ok(ok('https://fcm.googleapis.com/fcm/send/abc'));
+  assert.ok(ok('https://updates.push.services.mozilla.com/wpush/v2/abc'));
+  assert.ok(ok('https://web.push.apple.com/QAbc'));
+  assert.ok(ok('https://wns2-par02p.notify.windows.com/w/?token=abc'));
+  assert.ok(!ok('http://fcm.googleapis.com/fcm/send/abc'));          // not https
+  assert.ok(!ok('https://fcm.googleapis.com.evil.com/x'));
+  assert.ok(!ok('https://127.0.0.1/x'));
+  assert.ok(!ok('https://fcm.googleapis.com:8443/x'));
+  assert.ok(!ok('https://user:pw@fcm.googleapis.com/x'));
+  assert.ok(!cleanSubscription({ endpoint: 'https://fcm.googleapis.com/x', keys: { p256dh: 'x', auth: 'y' } }));
+});
+
+test('ringing a closed remembered device sends one push with a fresh room', async () => {
+  const sent = [];
+  let fail = null;
+  setPushSender(async (sub, payload, opts) => {
+    if (fail) { const e = new Error('push failed'); e.statusCode = fail; throw e; }
+    sent.push({ sub, payload: JSON.parse(payload), opts });
+  });
+  const sub = { endpoint: 'https://fcm.googleapis.com/fcm/send/xyz', keys: { p256dh: 'B'.repeat(87), auth: 'a'.repeat(22) } };
+  const a = await connected(client({ ip: '10.7.9.1' }));
+  hello(a, 'Laptop', 'devRrrrrrrrrrrrrrrr', [TOK('r')], 'lapTab3');
+  await sleep(50);
+  // Without holding the token: refused, nothing sent.
+  assert.ok((await call(a, 'presence:ring', { token: TOK('s'), sub })).error);
+  // A made-up address: refused as unusable.
+  assert.equal((await call(a, 'presence:ring', { token: TOK('r'), sub: { endpoint: 'https://evil.example/x', keys: sub.keys } })).gone, true);
+  assert.equal(sent.length, 0);
+
+  const res = await call(a, 'presence:ring', { token: TOK('r'), sub, clientId: 'lapTab3' });
+  assert.match(res.code, /^\d{6}$/);
+  assert.ok(rooms[res.code]);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].payload, { t: 'ring', code: res.code, from: 'Laptop', kind: 'laptop' });
+  assert.equal(sent[0].sub.endpoint, sub.endpoint);
+  // The ringer can go straight into the room.
+  assert.ok((await call(a, 'room:join', { code: res.code, clientId: 'lapTab3' })).selfId);
+
+  // Ringing again at once: refused.
+  const b = await connected(client({ ip: '10.7.9.2' }));
+  hello(b, 'Laptop2', 'devSsssssssssssssss', [TOK('r')], 'lapTab4');
+  await sleep(50);
+  assert.match((await call(b, 'presence:ring', { token: TOK('r'), sub })).error, /moment/);
+  assert.equal(sent.length, 1);
+
+  // A dead address is reported so the device can drop it.
+  const c = await connected(client({ ip: '10.7.9.3' }));
+  hello(c, 'Laptop3', 'devTtttttttttttttttt', [TOK('t')], 'lapTab5');
+  await sleep(50);
+  fail = 410;
+  assert.equal((await call(c, 'presence:ring', { token: TOK('t'), sub })).gone, true);
+  setPushSender(async () => {});
 });
 
 test('wrong guesses spread over many addresses hit a site-wide cap', async () => {

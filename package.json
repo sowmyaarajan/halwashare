@@ -1,6 +1,6 @@
 {
   "name": "halwashare",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Peer-to-peer chat and unlimited-size file sharing for the people around you",
   "main": "server.js",
   "scripts": {
@@ -13,7 +13,8 @@
   "dependencies": {
     "express": "^4.22.3",
     "qrcode": "^1.5.4",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "socket.io-client": "^4.8.4"
