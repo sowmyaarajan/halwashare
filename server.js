@@ -369,12 +369,34 @@ function leavePresence(socket) {
    a fresh pair is made at start-up, which is fine for trying it out. */
 const PUSH_HOSTS = /^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|[a-z0-9-]+\.notify\.windows\.com|[a-z0-9-]+(\.[a-z0-9-]+)*\.push\.apple\.com)$/;
 const B64URL_RE = /^[A-Za-z0-9_-]+$/;
+/* Read a setting forgivingly: a name or value pasted into a dashboard
+   easily picks up spaces, quotes or a line break. Says what it found,
+   never the value itself. */
+function envSetting(name) {
+  const key = Object.keys(process.env).find(k => k.trim().toUpperCase() === name);
+  if (!key) return { value: null, note: name + ' is missing' };
+  const value = String(process.env[key]).replace(/\s+/g, '').replace(/^["']|["']$/g, '');
+  const notes = [];
+  if (key !== name) notes.push('name has extra spaces or lower case');
+  if (value !== process.env[key]) notes.push('value had spaces, quotes or line breaks (removed)');
+  return { value: value || null, note: name + (notes.length ? ': ' + notes.join('; ') : ' ok') };
+}
+
 const vapid = (() => {
-  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-    return { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
-  }
-  if (process.env.NODE_ENV !== 'test') {
-    console.warn('[halwa] VAPID keys not set: knocks on closed devices stop working after a restart');
+  const pub = envSetting('VAPID_PUBLIC_KEY');
+  const priv = envSetting('VAPID_PRIVATE_KEY');
+  const quiet = process.env.NODE_ENV === 'test';
+  if (pub.value && priv.value) {
+    try {
+      // Throws if either key is not a valid VAPID key.
+      webpush.setVapidDetails('mailto:check@example.com', pub.value, priv.value);
+      if (!quiet) console.log('[halwa] push keys from the environment (' + pub.note + ', ' + priv.note + ')');
+      return { publicKey: pub.value, privateKey: priv.value };
+    } catch (err) {
+      if (!quiet) console.warn('[halwa] push keys in the environment are not valid VAPID keys: ' + err.message);
+    }
+  } else if (!quiet) {
+    console.warn('[halwa] push keys not set (' + pub.note + ', ' + priv.note + '): rings to closed devices stop working after a restart');
   }
   return webpush.generateVAPIDKeys();
 })();
