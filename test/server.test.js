@@ -671,6 +671,15 @@ test('push addresses must belong to a real push service', () => {
   assert.ok(!ok('https://fcm.googleapis.com:8443/x'));
   assert.ok(!ok('https://user:pw@fcm.googleapis.com/x'));
   assert.ok(!cleanSubscription({ endpoint: 'https://fcm.googleapis.com/x', keys: { p256dh: 'x', auth: 'y' } }));
+  // Padded spellings of one address are refused, so they cannot dodge the limits.
+  assert.ok(!ok('https://fcm.googleapis.com/fcm/send/abc?x=1'));
+  assert.ok(!ok('https://fcm.googleapis.com/fcm/send/abc#x'));
+  assert.ok(!ok('https://fcm.googleapis.com/fcm//send/abc'));
+  assert.ok(!ok('https://fcm.googleapis.com/fcm/send/a%62c'));
+  assert.ok(!ok('https://wns2-par02p.notify.windows.com/w/?token=abc&x=1'));
+  // and a different case of the host is the same address
+  assert.equal(cleanSubscription({ endpoint: 'https://FCM.googleapis.com/fcm/send/abc', keys }).endpoint,
+    'https://fcm.googleapis.com/fcm/send/abc');
 });
 
 test('ringing a closed remembered device sends one push with a fresh room', async () => {

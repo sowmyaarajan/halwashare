@@ -389,11 +389,21 @@ function cleanSubscription(sub) {
   let url;
   try { url = new URL(sub.endpoint); } catch (_) { return null; }
   if (url.protocol !== 'https:' || (url.port && url.port !== '443') || url.username || url.password) return null;
-  if (!PUSH_HOSTS.test(url.hostname)) return null;
+  if (!PUSH_HOSTS.test(url.hostname) || url.hash || sub.endpoint.includes('#')) return null;
+  // One device, one spelling of its address: each service's own exact
+  // form, rebuilt here, so padding an address cannot dodge the limits.
+  let endpoint;
+  if (/\.notify\.windows\.com$/.test(url.hostname)) {
+    if (url.pathname !== '/w/' || !/^\?token=[A-Za-z0-9%._~+\/=-]{1,800}$/.test(url.search)) return null;
+    endpoint = 'https://' + url.hostname + '/w/' + url.search;
+  } else {
+    if (url.search || !/^\/[A-Za-z0-9_:.\/-]{1,900}$/.test(url.pathname) || url.pathname.includes('//')) return null;
+    endpoint = 'https://' + url.hostname + url.pathname;
+  }
   const keys = sub.keys || {};
   if (typeof keys.p256dh !== 'string' || !B64URL_RE.test(keys.p256dh) || keys.p256dh.length < 80 || keys.p256dh.length > 100) return null;
   if (typeof keys.auth !== 'string' || !B64URL_RE.test(keys.auth) || keys.auth.length < 16 || keys.auth.length > 32) return null;
-  return { endpoint: url.href, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+  return { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } };
 }
 
 let sendPush = (sub, payload, options) => webpush.sendNotification(sub, payload, options);
@@ -402,19 +412,35 @@ let sendPush = (sub, payload, options) => webpush.sendNotification(sub, payload,
    device holding someone's address could invent a new token every time. */
 const lastKnock = new Map();   // token -> time
 const ringLimits = new Map();  // sha256(endpoint) -> { at, bucket }
-const KNOCK_GAP_MS = 15 * 1000;
-const RINGS_PER_HOUR = 12;
+const KNOCK_GAP_MS = 15 * 1000;     // per pairing
+const ADDRESS_GAP_MS = 5 * 1000;    // per push address, whatever the pairing
+const RINGS_PER_HOUR = 20;          // per push address
 
-function ringAllowed(token, endpoint, now) {
-  if (now - (lastKnock.get(token) || 0) < KNOCK_GAP_MS) return false;
+function ringLimitFor(endpoint, create) {
   const key = crypto.createHash('sha256').update(endpoint).digest('base64url');
   let lim = ringLimits.get(key);
-  if (lim && now - lim.at < KNOCK_GAP_MS) return false;
-  if (!lim) {
+  if (!lim && create) {
     if (ringLimits.size >= 10000) ringLimits.delete(ringLimits.keys().next().value);
-    lim = { at: 0, bucket: new Bucket(RINGS_PER_HOUR / 3600, RINGS_PER_HOUR / 2) };
+    lim = { at: 0, bucket: new Bucket(RINGS_PER_HOUR / 3600, 6) };
     ringLimits.set(key, lim);
   }
+  return lim;
+}
+
+/* Would a ring be allowed now? Charges nothing. */
+function canRing(token, endpoint, now) {
+  if (now - (lastKnock.get(token) || 0) < KNOCK_GAP_MS) return false;
+  const lim = ringLimitFor(endpoint, false);
+  if (!lim) return true;
+  if (now - lim.at < ADDRESS_GAP_MS) return false;
+  lim.bucket.take(0);                         // refill
+  return lim.bucket.tokens >= 1;
+}
+
+/* Charge for a ring that is about to be sent. */
+function chargeRing(token, endpoint, now) {
+  if (!canRing(token, endpoint, now)) return false;
+  const lim = ringLimitFor(endpoint, true);
   if (!lim.bucket.take(1)) return false;
   lim.at = now;
   lastKnock.set(token, now);
@@ -840,12 +866,16 @@ io.on('connection', (socket) => {
     const sub = cleanSubscription(arg.sub);
     if (!sub) return reply({ error: 'That device cannot be notified.', gone: true });
     if (!allow('invite')) return reply({ error: SLOW_DOWN });
-    if (!ringAllowed(token, sub.endpoint, Date.now())) return reply({ error: 'Already notified — give them a moment.' });
+    const busy = { error: 'Already notified — give them a moment.' };
+    if (!canRing(token, sub.endpoint, Date.now())) return reply(busy);
     if (!ipBucket(ip, 'create').take(1)) return reply({ error: SLOW_DOWN });
 
     const inviterId = typeof arg.clientId === 'string' && ID_RE.test(arg.clientId) ? arg.clientId : me.clientId;
     const res = createRoom(ip, inviterId);
     if (res.error) return reply({ error: res.error });
+    // Everything else passed: only now count it against the limits.
+    // (Synchronous from the check to here, so two rings cannot both slip in.)
+    if (!chargeRing(token, sub.endpoint, Date.now())) { delete rooms[res.code]; return reply(busy); }
     // No name: the ringed device shows its own name for the pairing.
     const payload = JSON.stringify({ t: 'ring', code: res.code, mac: ringMac(token, res.code) });
     try {
