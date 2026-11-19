@@ -714,19 +714,22 @@ io.on('connection', (socket) => {
       ? targets.map(s => s.data.code && rooms[s.data.code]).find(r => r && r.users.length < MAX_USERS)
       : null;
     if (theirs) {
-      if (token) {
-        // A remembered device: straight in.
+      // A remembered device goes straight in, but only where it would meet
+      // just that device: anyone else in the room never agreed to it.
+      const alone = token && theirs.users.length === 1 &&
+        targets.some(s => s.data.code === theirs.code && s.data.pid === theirs.users[0].pid);
+      if (alone) {
         if (inviterId) rememberMember(theirs, inviterId);
         return reply({ code: theirs.code });
       }
-      // Anyone else nearby knocks, and someone in the room lets them in.
+      // Otherwise knock, and someone in the room lets them in.
       const kid = newPid();
       for (const s of targets) {
         if (!s.data.code || rooms[s.data.code] !== theirs) continue;
         const knocks = s.data.knocks || (s.data.knocks = new Map());
         if (knocks.size >= 20) knocks.delete(knocks.keys().next().value);
         knocks.set(kid, { code: theirs.code, from: socket, clientId: inviterId, at: Date.now() });
-        s.emit('presence:knock', { kid, from: me.name, kind: me.kind });
+        s.emit('presence:knock', { kid, from: me.name, kind: me.kind, token });
       }
       return reply({ waiting: true, kid });
     }

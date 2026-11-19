@@ -335,7 +335,8 @@ function startPresence(socket, on) {
   });
   socket.on('presence:knock', (k) => {
     if (!k || typeof k.kid !== 'string' || !on.knock) return;
-    on.knock({ kid: k.kid, kind: k.kind, from: cleanDeviceName(k.from) || 'A device' });
+    const paired = k.token ? getPaired().find(p => p.token === k.token) : null;
+    on.knock({ kid: k.kid, kind: k.kind, paired: !!paired, from: paired ? paired.name : cleanDeviceName(k.from) || 'A device' });
   });
   socket.on('presence:declined', (d) => {
     if (d && typeof d.kid === 'string' && on.declined) on.declined({ kid: d.kid, from: cleanDeviceName(d.from) || 'They' });
@@ -3003,14 +3004,15 @@ if (isRoomPage) {
   /* ── Nearby and remembered devices, from inside a room ─────── */
   const presence = startPresence(socket, { change: paintNearbyCount, invited: onInvitedInRoom, knock: onKnock });
 
-  /* Someone nearby who is not in a room asked to join this one. */
+  /* Someone not in a room asked to join this one: a nearby device, or a
+     remembered one while others are here too. */
   function onKnock(k) {
     const bar = document.createElement('div');
     bar.className = 'share-confirm';
     bar.setAttribute('role', 'dialog');
     const title = document.createElement('p');
     title.className = 'share-confirm-title';
-    title.textContent = kindIcon(k.kind) + ' ' + k.from + ' (on this Wi-Fi) wants to join this room.';
+    title.textContent = kindIcon(k.kind) + ' ' + k.from + (k.paired ? ' (your remembered device)' : ' (on this Wi-Fi)') + ' wants to join this room.';
     const actions = document.createElement('div');
     actions.className = 'share-confirm-actions';
     const no = document.createElement('button');

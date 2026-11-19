@@ -611,6 +611,17 @@ test('a remembered device that left goes back into the room the other is still i
   assert.equal(res.code, code);
   const j = await call(b, 'room:join', { code, clientId: 'phnTab1', name: 'Phone' });
   assert.equal(j.label, 'Phone');
+
+  // With someone else in the room as well, a remembered device knocks.
+  const c = await connected(client({ ip: '10.7.6.9' }));
+  hello(c, 'Tablet', 'devQqqqqqqqqqqqqqqq', [TOK('l')], 'tabTab1');
+  await sleep(80);
+  const knock = next(a, 'presence:knock');
+  const r2 = await call(c, 'presence:invite', { token: TOK('l'), clientId: 'tabTab1' });
+  assert.equal(r2.waiting, true);
+  assert.equal(r2.code, undefined);
+  assert.equal((await knock).token, TOK('l'));
+  assert.ok(!rooms[code].members.has('tabTab1'));
 });
 
 test('a nearby device knocks on a room, and comes in only when let in', async () => {
