@@ -397,8 +397,37 @@ function cleanSubscription(sub) {
 }
 
 let sendPush = (sub, payload, options) => webpush.sendNotification(sub, payload, options);
-const lastKnock = new Map();   // token -> time, so one pair cannot be rung non-stop
+/* Limits per pairing token and per push address. The token alone is not
+   enough: the server cannot tell a real pairing from a made-up one, so a
+   device holding someone's address could invent a new token every time. */
+const lastKnock = new Map();   // token -> time
+const ringLimits = new Map();  // sha256(endpoint) -> { at, bucket }
 const KNOCK_GAP_MS = 15 * 1000;
+const RINGS_PER_HOUR = 12;
+
+function ringAllowed(token, endpoint, now) {
+  if (now - (lastKnock.get(token) || 0) < KNOCK_GAP_MS) return false;
+  const key = crypto.createHash('sha256').update(endpoint).digest('base64url');
+  let lim = ringLimits.get(key);
+  if (lim && now - lim.at < KNOCK_GAP_MS) return false;
+  if (!lim) {
+    if (ringLimits.size >= 10000) ringLimits.delete(ringLimits.keys().next().value);
+    lim = { at: 0, bucket: new Bucket(RINGS_PER_HOUR / 3600, RINGS_PER_HOUR / 2) };
+    ringLimits.set(key, lim);
+  }
+  if (!lim.bucket.take(1)) return false;
+  lim.at = now;
+  lastKnock.set(token, now);
+  if (lastKnock.size > 10000) lastKnock.delete(lastKnock.keys().next().value);
+  return true;
+}
+
+/* Signed with the pairing token, so the ringed device can check the ring
+   comes from a pairing it still holds. Made-up tokens and forgotten
+   pairings fail there, whatever the server let through. */
+function ringMac(token, code) {
+  return crypto.createHmac('sha256', token).update('halwa-ring-v1|' + code).digest('base64url');
+}
 
 /* ── HTTP ──────────────────────────────────────────────────── */
 const app = express();
@@ -811,16 +840,14 @@ io.on('connection', (socket) => {
     const sub = cleanSubscription(arg.sub);
     if (!sub) return reply({ error: 'That device cannot be notified.', gone: true });
     if (!allow('invite')) return reply({ error: SLOW_DOWN });
-    const now = Date.now();
-    if (now - (lastKnock.get(token) || 0) < KNOCK_GAP_MS) return reply({ error: 'Already notified — give them a moment.' });
+    if (!ringAllowed(token, sub.endpoint, Date.now())) return reply({ error: 'Already notified — give them a moment.' });
     if (!ipBucket(ip, 'create').take(1)) return reply({ error: SLOW_DOWN });
-    lastKnock.set(token, now);
-    if (lastKnock.size > 10000) lastKnock.delete(lastKnock.keys().next().value);
 
     const inviterId = typeof arg.clientId === 'string' && ID_RE.test(arg.clientId) ? arg.clientId : me.clientId;
     const res = createRoom(ip, inviterId);
     if (res.error) return reply({ error: res.error });
-    const payload = JSON.stringify({ t: 'ring', code: res.code, from: me.name, kind: me.kind });
+    // No name: the ringed device shows its own name for the pairing.
+    const payload = JSON.stringify({ t: 'ring', code: res.code, mac: ringMac(token, res.code) });
     try {
       await sendPush(sub, payload, { TTL: 120, urgency: 'high', topic: 'halwa-ring', timeout: 8000 });
       reply({ code: res.code });

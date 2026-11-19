@@ -151,24 +151,59 @@ self.addEventListener('fetch', (event) => {
 /* ── Notifications ──────────────────────────────────────────
    Tapping one brings the room back to the front, or reopens it. */
 /* A remembered device rang this one while HalwaShare was closed. The
-   message was encrypted for this device alone; tapping it opens the room. */
+   message was encrypted for this device alone, and signed with the
+   pairing token: only a ring from a pairing this device still holds
+   shows a name and opens a room. Anything else is shown plainly (every
+   push must show something), and this push address is retired so
+   whoever holds it can no longer ring; remembered devices are given the
+   new one the next time they meet in a room. */
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function ringFrom(d) {
+  if (!d || d.t !== 'ring' || typeof d.code !== 'string' || !/^\d{6}$/.test(d.code) || typeof d.mac !== 'string') return null;
+  let list = [];
+  try {
+    const res = await (await caches.open('halwa-paired')).match('/__paired');
+    list = res ? await res.json() : [];
+  } catch (_) { return null; }
+  const enc = new TextEncoder();
+  for (const p of Array.isArray(list) ? list : []) {
+    if (!p || typeof p.token !== 'string') continue;
+    const key = await crypto.subtle.importKey('raw', enc.encode(p.token), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = b64url(await crypto.subtle.sign('HMAC', key, enc.encode('halwa-ring-v1|' + d.code)));
+    if (mac === d.mac) return { name: String(p.name || 'A remembered device').slice(0, 40), code: d.code };
+  }
+  return null;
+}
+
 self.addEventListener('push', (event) => {
-  let d = null;
-  try { d = event.data && event.data.json(); } catch (_) {}
-  const ok = d && d.t === 'ring' && typeof d.code === 'string' && /^\d{6}$/.test(d.code);
-  const from = ok && typeof d.from === 'string' ? d.from.slice(0, 40) : 'A remembered device';
-  // Browsers require every push to show something.
-  event.waitUntil(self.registration.showNotification(
-    ok ? from + ' wants to connect' : 'HalwaShare',
-    {
-      body: ok ? 'Tap to join them on HalwaShare' : 'Open HalwaShare',
-      tag: 'halwa-ring',
-      renotify: true,
-      requireInteraction: true,
-      icon: '/icons/icon-192.png',
-      data: { url: ok ? '/join/' + d.code : '/' },
+  event.waitUntil((async () => {
+    let d = null;
+    try { d = event.data && event.data.json(); } catch (_) {}
+    const ring = await ringFrom(d);
+    if (ring) {
+      return self.registration.showNotification(ring.name + ' wants to connect', {
+        body: 'Tap to join them on HalwaShare',
+        tag: 'halwa-ring',
+        renotify: true,
+        requireInteraction: true,
+        icon: '/icons/icon-192.png',
+        data: { url: '/join/' + ring.code },
+      });
     }
-  ));
+    try {
+      const sub = await self.registration.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+    } catch (_) {}
+    return self.registration.showNotification('HalwaShare', {
+      body: 'Ignored a ring from a device this one no longer remembers.',
+      tag: 'halwa-ring-ignored',
+      icon: '/icons/icon-192.png',
+      data: { url: '/' },
+    });
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {

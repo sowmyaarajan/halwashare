@@ -221,7 +221,8 @@ stranger and a room. The server is built to be safe on the open internet:
 | Flooding the server with rooms | Room creation limited per IP, at most `MAX_ROOMS_PER_IP` open per address, `MAX_ROOMS` in total; empty rooms expire after 2 minutes |
 | Malformed messages | Strict type checks, and every handler is guarded: a bad message drops that connection, never the server |
 | Exhausting memory | Room history (file offers, joins) capped at 128 KB per room; chat is not kept on the server at all; a receiver that stops reading is not buffered for |
-| Making the server send requests elsewhere | Rings go only to known push services over https on the standard port; at most one ring per pairing every 15 seconds |
+| Making the server send requests elsewhere | Rings go only to known push services over https on the standard port |
+| Ringing someone over and over | At most one ring every 15 seconds per pairing and per push address, and 12 an hour per address. Each ring is signed with the pairing secret; the ringed device shows a name and opens the room only if it still holds that pairing. Otherwise it ignores the ring and retires its push address, so a forgotten device can no longer ring it |
 | Floods of signalling or relay bytes | Per-connection rate limits; relay bytes and messages are paced (never dropped), counted against a backlog cap, and a sender ignoring flow control is disconnected |
 | Floods of pictures | Receivers auto-fetch only small images, up to 60 MB per visit; everything else waits for a click |
 | Too many connections | `MAX_CONN_PER_IP` open sockets per address |

@@ -694,7 +694,9 @@ test('ringing a closed remembered device sends one push with a fresh room', asyn
   assert.match(res.code, /^\d{6}$/);
   assert.ok(rooms[res.code]);
   assert.equal(sent.length, 1);
-  assert.deepEqual(sent[0].payload, { t: 'ring', code: res.code, from: 'Laptop', kind: 'laptop' });
+  // Signed with the pairing token, and no name the ringer chose.
+  const mac = require('crypto').createHmac('sha256', TOK('r')).update('halwa-ring-v1|' + res.code).digest('base64url');
+  assert.deepEqual(sent[0].payload, { t: 'ring', code: res.code, mac });
   assert.equal(sent[0].sub.endpoint, sub.endpoint);
   // The ringer can go straight into the room.
   assert.ok((await call(a, 'room:join', { code: res.code, clientId: 'lapTab3' })).selfId);
@@ -706,12 +708,19 @@ test('ringing a closed remembered device sends one push with a fresh room', asyn
   assert.match((await call(b, 'presence:ring', { token: TOK('r'), sub })).error, /moment/);
   assert.equal(sent.length, 1);
 
+  // Nor with a made-up token for the same address.
+  const m = await connected(client({ ip: '10.7.9.4' }));
+  hello(m, 'Liar', 'devUuuuuuuuuuuuuuuu', [TOK('m')], 'lapTab6');
+  await sleep(50);
+  assert.match((await call(m, 'presence:ring', { token: TOK('m'), sub })).error, /moment/);
+  assert.equal(sent.length, 1);
+
   // A dead address is reported so the device can drop it.
   const c = await connected(client({ ip: '10.7.9.3' }));
   hello(c, 'Laptop3', 'devTtttttttttttttttt', [TOK('t')], 'lapTab5');
   await sleep(50);
   fail = 410;
-  assert.equal((await call(c, 'presence:ring', { token: TOK('t'), sub })).gone, true);
+  assert.equal((await call(c, 'presence:ring', { token: TOK('t'), sub: Object.assign({}, sub, { endpoint: sub.endpoint + 'dead' }) })).gone, true);
   setPushSender(async () => {});
 });
 

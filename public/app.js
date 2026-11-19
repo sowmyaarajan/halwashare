@@ -270,6 +270,18 @@ function getPaired() {
 
 function savePaired(list) {
   try { localStorage.setItem('halwa-paired', JSON.stringify(list.slice(0, 50))); } catch (_) {}
+  mirrorPairedForWorker(list.slice(0, 50));
+}
+
+/* The service worker cannot read localStorage, but it must check that a
+   ring comes from a pairing this device still holds, and show the name
+   this device gave it. So keep a copy of tokens and names where it can. */
+function mirrorPairedForWorker(list) {
+  if (!('caches' in window) || !window.isSecureContext) return;
+  const body = JSON.stringify((list || getPaired()).map(p => ({ token: p.token, name: p.name })));
+  caches.open('halwa-paired')
+    .then(c => c.put('/__paired', new Response(body, { headers: { 'Content-Type': 'application/json' } })))
+    .catch(() => {});
 }
 
 function addPaired(rec) {
@@ -282,6 +294,8 @@ function addPaired(rec) {
 function removePaired(token) {
   savePaired(getPaired().filter(p => p.token !== token));
 }
+
+mirrorPairedForWorker();
 
 /* Keep a remembered device's push address (or drop it with null). */
 function setPairedPush(token, sub) {
