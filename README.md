@@ -27,7 +27,7 @@ code in the room sidebar.
 
 - **Nearby**: other devices with HalwaShare open on the same network (the same public address) show on the start page and under 📡 in a room. Tap *Connect* and they are asked to join.
 - **Your devices**: in a room, tap a person and choose *Remember this device*. From then on it appears on the start page whenever it is online, and *Connect* takes both straight into a new room, no questions asked. *✕* forgets it on both sides.
-- **Same room again**: if the other device is already in a room, *Connect* takes you into that room instead of starting a new one. A remembered device goes straight in; a nearby one knocks and someone in the room taps *Let in*.
+- **Same room again**: if the other device is already in a room, *Connect* takes you into that room instead of starting a new one. A remembered device goes straight in when it is alone in that room; otherwise (a nearby device, or others in the room too) it knocks and someone in the room taps *Let in*.
 
 Each device has a name (shown in rooms instead of "User 2"). Change it with *Rename* on the start page, or in a room by tapping your own name (✏️) — everyone sees the new name at once.
 On a shared network — an office, a café — everyone with HalwaShare open sees that name. *Hide me from nearby* on the start page takes the device off the list (and hides the list from it); remembered devices still find it.
